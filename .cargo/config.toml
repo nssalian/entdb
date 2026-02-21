@@ -1,0 +1,9 @@
+[alias]
+coverage = "llvm-cov --workspace --all-targets --fail-under-lines 80"
+coverage-lcov = "llvm-cov --workspace --all-targets --lcov --output-path lcov.info --fail-under-lines 80 --fail-under-regions 70"
+stress = "test -p entdb --test stress_storage -- --ignored"
+stress-wal = "test -p entdb --test stress_wal -- --ignored"
+perf = "test -p entdb --test perf_regression -- --ignored"
+crash-matrix = "test -p entdb --test crash_matrix"
+soak = "test -p entdb --test mvcc_stress_query -- --ignored"
+perf-criterion = "bench -p entdb --bench core_bench -- --noplot"

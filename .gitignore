@@ -1,0 +1,44 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Build/test artifacts
+coverage/
+release_readiness.log
+
+# Fuzz artifacts
+fuzz/artifacts/
+fuzz/coverage/
+fuzz/corpus/**/.state/
+fuzz/corpus/*
+!fuzz/corpus/.gitkeep
+!fuzz/corpus/**/.gitkeep
+!fuzz/corpus/**/README.md
+
+# Local env
+.env
+.env.*
+.venv/
+.DS_Store
+
+# Local database/runtime files
+*.data
+*.wal
+*.txn.wal
+*.txn.json
+*.catalog.json
+*.optimizer_history.json
+
+# Docs output
+docs-site/book/
+
+# IDE
+.vscode/
+.idea/
+
+# Perf artifacts (keep committed baseline config)
+perf/*
+!perf/baselines.json
+!perf/history/
+perf/history/*
+!perf/history/.gitkeep

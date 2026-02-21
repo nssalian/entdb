@@ -1,0 +1,36 @@
+[package]
+name = "entdb"
+version = "0.1.0"
+edition = "2021"
+description = "Rust-based SQL database engine core for EntDB."
+license = "Apache-2.0"
+repository = "https://github.com/nssalian/entdb"
+readme = "README.md"
+keywords = ["database", "sql", "storage", "mvcc", "wal"]
+categories = ["database-implementations"]
+
+[dependencies]
+crc32fast = "1.4"
+parking_lot = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sqlparser = "0.55"
+thiserror = "2.0"
+tracing = "0.1"
+time = { version = "0.3", features = ["parsing"] }
+polyglot-sql = "0.1.4"
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1.5"
+rand = "0.8"
+tempfile = "3.14"
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[[bench]]
+name = "core_bench"
+harness = false
+
+[[bench]]
+name = "comparative_bench"
+harness = false

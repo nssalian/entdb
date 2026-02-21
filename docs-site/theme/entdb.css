@@ -1,0 +1,46 @@
+:root {
+    --content-max-width: 920px;
+    --ent-forest: #2f5d46;
+    --ent-bark: #7a5c46;
+    --ent-bark-soft: #f2ece8;
+    --ent-mist: #f7f8f4;
+}
+
+h1,
+h2,
+h3 {
+    letter-spacing: -0.01em;
+}
+
+.content main {
+    line-height: 1.65;
+}
+
+code {
+    border-radius: 6px;
+}
+
+.chapter li a.active {
+    color: var(--ent-forest) !important;
+    border-left: 3px solid var(--ent-bark);
+    padding-left: 8px;
+}
+
+a {
+    color: var(--ent-forest);
+    text-decoration-color: var(--ent-bark);
+}
+
+a:hover {
+    color: var(--ent-bark);
+}
+
+.sidebar .chapter li a {
+    font-weight: 500;
+}
+
+blockquote {
+    border-left: 4px solid var(--ent-bark);
+    background: var(--ent-bark-soft);
+    padding: 0.4rem 0.8rem;
+}

@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 260" fill="none">
+  <rect width="860" height="260" rx="28" fill="#F4F7F2"/>
+  <g transform="translate(34,26)">
+    <g transform="translate(0,2)">
+      <rect x="10" y="112" width="160" height="12" rx="6" fill="#1F4D3A"/>
+      <path d="M24 124v20c0 11 9 20 20 20h92c11 0 20-9 20-20v-20" stroke="#1F4D3A" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M90 124V40" stroke="#1F4D3A" stroke-width="8" stroke-linecap="round"/>
+      <path d="M90 48c-22 10-36 26-46 46" stroke="#1F4D3A" stroke-width="8" stroke-linecap="round"/>
+      <path d="M90 56c24 11 38 26 48 48" stroke="#1F4D3A" stroke-width="8" stroke-linecap="round"/>
+      <path d="M90 30c-28-13-42-31-46-52" stroke="#1F4D3A" stroke-width="8" stroke-linecap="round"/>
+      <path d="M90 28c30-13 44-31 48-52" stroke="#1F4D3A" stroke-width="8" stroke-linecap="round"/>
+    </g>
+    <text x="220" y="118" fill="#1F4D3A" font-size="92" font-family="Georgia, Times New Roman, serif" font-weight="700">EntDB</text>
+    <text x="224" y="154" fill="#4A6A5B" font-size="20" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial">B+Tree database engine with PostgreSQL wire compatibility</text>
+  </g>
+</svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 260" fill="none">
+  <rect width="860" height="260" rx="28" fill="#F4F7F2"/>
+  <g transform="translate(34,26)">
+    <g transform="translate(0,2)">
+      <rect x="10" y="112" width="160" height="12" rx="6" fill="#1F4D3A"/>
+      <path d="M24 124v20c0 11 9 20 20 20h92c11 0 20-9 20-20v-20" stroke="#1F4D3A" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M90 124V40" stroke="#1F4D3A" stroke-width="8" stroke-linecap="round"/>
+      <path d="M90 48c-22 10-36 26-46 46" stroke="#1F4D3A" stroke-width="8" stroke-linecap="round"/>
+      <path d="M90 56c24 11 38 26 48 48" stroke="#1F4D3A" stroke-width="8" stroke-linecap="round"/>
+      <path d="M90 30c-28-13-42-31-46-52" stroke="#1F4D3A" stroke-width="8" stroke-linecap="round"/>
+      <path d="M90 28c30-13 44-31 48-52" stroke="#1F4D3A" stroke-width="8" stroke-linecap="round"/>
+    </g>
+    <text x="220" y="118" fill="#1F4D3A" font-size="92" font-family="Georgia, Times New Roman, serif" font-weight="700">EntDB</text>
+    <text x="224" y="154" fill="#4A6A5B" font-size="20" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial">B+Tree database engine with PostgreSQL wire compatibility</text>
+  </g>
+</svg>
