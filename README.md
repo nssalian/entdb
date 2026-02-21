@@ -5,7 +5,6 @@
 [![entdb docs](https://img.shields.io/docsrs/entdb?label=entdb%20docs)](https://docs.rs/entdb)
 [![entdb-server crate](https://img.shields.io/crates/v/entdb-server.svg?label=entdb-server%20crate)](https://crates.io/crates/entdb-server)
 [![entdb-server docs](https://img.shields.io/docsrs/entdb-server?label=entdb-server%20docs)](https://docs.rs/entdb-server)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 <p align="center">
   <img src="docs-site/src/assets/hero.png" alt="EntDB hero" width="360" />
