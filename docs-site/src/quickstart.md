@@ -67,18 +67,14 @@ Expected result:
   2 | bob
 ```
 
-
-### 4. Verify transpiler behavior (optional)
-
-With `ENTDB_POLYGLOT=1`, this MySQL-style query is accepted:
-
-```sql
-SELECT `id`, `name` FROM users ORDER BY `id` LIMIT 1, 1;
-```
-
-and is transpiled to PostgreSQL form internally before execution.
-
 ## Path B: Embedded Rust API
+
+Add to `Cargo.toml`:
+
+```toml
+[dependencies]
+entdb = "0.1.0"
+```
 
 ```rust
 use entdb::EntDb;
