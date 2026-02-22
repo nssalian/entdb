@@ -1,0 +1,19 @@
+:root {
+  --content-max-width: 920px;
+}
+
+h1, h2, h3 {
+  letter-spacing: -0.01em;
+}
+
+.content main {
+  line-height: 1.65;
+}
+
+code {
+  border-radius: 6px;
+}
+
+.sidebar .chapter li a {
+  font-weight: 500;
+}

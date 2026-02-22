@@ -1,0 +1,49 @@
+[package]
+name = "entdb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+entdb = { path = "../crates/entdb" }
+sqlparser = "0.55"
+tempfile = "3.25"
+
+[[bin]]
+name = "tuple_roundtrip"
+path = "fuzz_targets/tuple_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_decode"
+path = "fuzz_targets/wal_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "query_parse_bind"
+path = "fuzz_targets/query_parse_bind.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "catalog_load"
+path = "fuzz_targets/catalog_load.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "polyglot_transpile"
+path = "fuzz_targets/polyglot_transpile.rs"
+test = false
+doc = false
+bench = false

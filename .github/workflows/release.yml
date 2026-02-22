@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish-crates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Package check (entdb)
+        run: cargo publish -p entdb --locked --dry-run
+
+      - name: Publish entdb
+        run: cargo publish -p entdb --locked --token "${{ secrets.CARGO_TOKEN }}"
+
+      - name: Publish entdb-server (retry for index propagation)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..10}; do
+            if cargo publish -p entdb-server --locked --token "${{ secrets.CARGO_TOKEN }}"; then
+              exit 0
+            fi
+            echo "entdb-server publish attempt $i failed; retrying in 30s..."
+            sleep 30
+          done
+          echo "entdb-server publish failed after retries"
+          exit 1

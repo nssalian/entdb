@@ -1,0 +1,4 @@
+[workspace]
+members = ["crates/entdb", "crates/entdb-server", "fuzz"]
+resolver = "2"
+default-members = ["crates/entdb", "crates/entdb-server"]

@@ -1,0 +1,14 @@
+[book]
+authors = ["EntDB"]
+language = "en"
+src = "src"
+title = "EntDB Docs"
+description = "EntDB user documentation."
+
+[build]
+build-dir = "book"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+additional-css = ["theme/entdb.css"]
