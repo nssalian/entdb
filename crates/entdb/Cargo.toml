@@ -18,7 +18,7 @@ sqlparser = "0.55"
 thiserror = "2.0"
 tracing = "0.1"
 time = { version = "0.3", features = ["parsing"] }
-polyglot-sql = "0.1.4"
+polyglot-sql = "0.1.5"
 
 [dev-dependencies]
 criterion = "0.5"

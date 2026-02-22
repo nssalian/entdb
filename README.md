@@ -21,7 +21,30 @@ EntDB is a Rust-based SQL database engine with a PostgreSQL wire-compatible serv
 - SQL subset for OLTP-style workloads.
 - pgwire server for `psql` and PostgreSQL drivers.
 
-## Run
+## Polyglot SQL ingress (optional)
+
+When enabled, EntDB rewrites selected non-PostgreSQL SQL forms before parsing.
+It uses the external [`polyglot-sql`](https://crates.io/crates/polyglot-sql) crate.
+This is available in both execution paths:
+
+- server path: set `ENTDB_POLYGLOT=1`
+- embedded path: `engine.set_polyglot_enabled(true)` (or `ConnectOptions`)
+
+Current rewrites:
+
+- MySQL-style backticks: `` `users` `` -> `"users"`
+- MySQL numeric `LIMIT offset, count` -> `LIMIT count OFFSET offset`
+
+## Run Server
+
+From crates.io (when `entdb-server` is published):
+
+```bash
+cargo install entdb-server --locked
+entdb --host 127.0.0.1 --port 5433 --data-path ./entdb.data --auth-user entdb --auth-password entdb
+```
+
+From source (this repo):
 
 ```bash
 cargo run -p entdb-server -- \
@@ -33,6 +56,12 @@ cargo run -p entdb-server -- \
 ```
 
 Optional polyglot ingress rewrites:
+
+```bash
+ENTDB_POLYGLOT=1 entdb --host 127.0.0.1 --port 5433 --data-path ./entdb.data --auth-user entdb --auth-password entdb
+```
+
+or from source:
 
 ```bash
 ENTDB_POLYGLOT=1 cargo run -p entdb-server -- \

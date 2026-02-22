@@ -9,6 +9,15 @@ Run EntDB locally using one of two paths:
 
 ### 1. Start the server
 
+From crates.io (when `entdb-server` is published):
+
+```bash
+cargo install entdb-server --locked
+entdb --host 127.0.0.1 --port 5433 --data-path ./entdb.data --auth-user entdb --auth-password entdb
+```
+
+From source (this repo):
+
 ```bash
 cargo run -p entdb-server -- \
   --host 127.0.0.1 \
@@ -19,6 +28,12 @@ cargo run -p entdb-server -- \
 ```
 
 Optional: enable polyglot ingress rewrites (MySQL-style backticks and numeric `LIMIT offset, count`):
+
+```bash
+ENTDB_POLYGLOT=1 entdb --host 127.0.0.1 --port 5433 --data-path ./entdb.data --auth-user entdb --auth-password entdb
+```
+
+or from source:
 
 ```bash
 ENTDB_POLYGLOT=1 cargo run -p entdb-server -- \
@@ -51,6 +66,17 @@ Expected result:
   1 | alice
   2 | bob
 ```
+
+
+### 4. Verify transpiler behavior (optional)
+
+With `ENTDB_POLYGLOT=1`, this MySQL-style query is accepted:
+
+```sql
+SELECT `id`, `name` FROM users ORDER BY `id` LIMIT 1, 1;
+```
+
+and is transpiled to PostgreSQL form internally before execution.
 
 ## Path B: Embedded Rust API
 

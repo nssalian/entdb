@@ -33,6 +33,43 @@ It also supports:
 - typed parameter binding for extended protocol (AST-level binding, no string substitution),
 - optional SQL dialect transpilation ingress with guarded fallback/error contracts.
 
+## SQL Dialect Transpiler Support
+
+EntDB includes a guarded SQL transpiler ingress for selected non-PostgreSQL query shapes.
+
+It uses the external [`polyglot-sql`](https://crates.io/crates/polyglot-sql) crate.
+
+How it works:
+
+- Transpiler is disabled by default.
+- Enable it with `ENTDB_POLYGLOT=1` (server) or `engine.set_polyglot_enabled(true)` (embedded `QueryEngine`).
+- SQL is transpiled before PostgreSQL parsing/binding.
+- If transpilation changes SQL, EntDB records original and transpiled forms in error context for debugging.
+
+Currently supported rewrites:
+
+- MySQL-style identifier quoting: `` `users` `` -> `"users"`
+- MySQL numeric `LIMIT offset, count` -> PostgreSQL `LIMIT count OFFSET offset`
+
+Guardrails and behavior:
+
+- Non-numeric `LIMIT offset, count` is left unchanged (no unsafe guessing).
+- Unbalanced backticks are rejected.
+- Unsupported delimiter syntax is rejected.
+- Rewriter only triggers for candidate inputs; normal PostgreSQL SQL bypasses transpilation.
+
+Example (with transpiler enabled):
+
+```sql
+SELECT `id`, `name` FROM `users` ORDER BY `id` LIMIT 1, 2;
+```
+
+is executed as:
+
+```sql
+SELECT "id", "name" FROM "users" ORDER BY "id" LIMIT 2 OFFSET 1;
+```
+
 ## Why this design
 
 - Same core engine for embedded and pgwire paths.
