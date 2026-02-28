@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-use crate::catalog::{Catalog, Schema};
+use crate::catalog::{Catalog, IndexType, Schema};
 use crate::error::Result;
+use crate::query::executor::bm25_maintenance::rebuild_bm25_index;
 use crate::query::executor::Executor;
 use crate::types::Value;
 use std::sync::Arc;
@@ -26,6 +27,7 @@ pub struct CreateIndexExecutor {
     columns: Vec<String>,
     unique: bool,
     if_not_exists: bool,
+    index_type: IndexType,
     catalog: Arc<Catalog>,
     done: bool,
     out_schema: Schema,
@@ -39,6 +41,7 @@ impl CreateIndexExecutor {
         columns: Vec<String>,
         unique: bool,
         if_not_exists: bool,
+        index_type: IndexType,
         catalog: Arc<Catalog>,
     ) -> Self {
         Self {
@@ -47,6 +50,7 @@ impl CreateIndexExecutor {
             columns,
             unique,
             if_not_exists,
+            index_type,
             catalog,
             done: false,
             out_schema: Schema { columns: vec![] },
@@ -77,12 +81,18 @@ impl Executor for CreateIndexExecutor {
             self.affected_rows = 0;
             return Ok(None);
         }
-        self.catalog.create_index(
+        let created = self.catalog.create_index(
             &self.table_name,
             &self.index_name,
             &self.columns,
             self.unique,
+            self.index_type.clone(),
         )?;
+        if matches!(created.index_type, IndexType::Bm25 { .. }) {
+            if let Some(table) = self.catalog.get_table(&self.table_name) {
+                rebuild_bm25_index(&self.catalog, &table, &created)?;
+            }
+        }
         self.done = true;
         self.affected_rows = 1;
         Ok(None)

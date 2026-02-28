@@ -164,3 +164,94 @@ fn sum_and_avg_require_numeric_column() {
         .expect_err("avg text should fail");
     assert!(avg_err.to_string().contains("SUM/AVG require numeric"));
 }
+
+#[test]
+fn bm25_rejects_unsupported_text_config() {
+    let engine = setup_engine();
+    engine
+        .execute("CREATE TABLE docs (id INT, content TEXT)")
+        .expect("create table");
+    let err = engine
+        .execute(
+            "CREATE INDEX idx_docs_bm25 ON docs USING bm25 (content) WITH (text_config='german')",
+        )
+        .expect_err("unsupported text_config should fail");
+    assert!(err.to_string().contains("unsupported bm25 text_config"));
+}
+
+#[test]
+fn vector_literal_dimension_mismatch_fails() {
+    let engine = setup_engine();
+    engine
+        .execute("CREATE TABLE embeddings (id INT, vec VECTOR(3))")
+        .expect("create table");
+    let err = engine
+        .execute("INSERT INTO embeddings VALUES (1, '[1,2]')")
+        .expect_err("dimension mismatch should fail");
+    assert!(err.to_string().contains("vector dimension mismatch"));
+}
+
+#[test]
+fn to_bm25query_requires_text_arguments() {
+    let engine = setup_engine();
+    engine
+        .execute("CREATE TABLE docs (id INT, content TEXT)")
+        .expect("create table");
+    engine
+        .execute("INSERT INTO docs VALUES (1, 'database systems')")
+        .expect("insert");
+    engine
+        .execute("CREATE INDEX idx_docs_bm25 ON docs USING bm25 (content)")
+        .expect("create index");
+    let err = engine
+        .execute("SELECT content <@ to_bm25query(42, 'idx_docs_bm25') FROM docs")
+        .expect_err("invalid argument type should fail");
+    assert!(err
+        .to_string()
+        .contains("to_bm25query first argument must be TEXT"));
+}
+
+#[test]
+fn bm25_query_with_join_shape_executes_without_planner_specialization() {
+    let engine = setup_engine();
+    engine
+        .execute("CREATE TABLE docs (id INT, content TEXT)")
+        .expect("create docs");
+    engine
+        .execute("CREATE TABLE tags (id INT, tag TEXT)")
+        .expect("create tags");
+    engine
+        .execute("INSERT INTO docs VALUES (1, 'database systems'), (2, 'query planner')")
+        .expect("insert docs");
+    engine
+        .execute("INSERT INTO tags VALUES (1, 'db'), (2, 'opt')")
+        .expect("insert tags");
+    engine
+        .execute("CREATE INDEX idx_docs_bm25 ON docs USING bm25 (content)")
+        .expect("index");
+
+    let out = engine.execute(
+        "SELECT docs.id, docs.content <@ to_bm25query('database', 'idx_docs_bm25') \
+         FROM docs INNER JOIN tags ON docs.id = tags.id ORDER BY docs.id",
+    );
+    assert!(out.is_ok(), "join-shaped bm25 query should execute");
+}
+
+#[test]
+fn bm25_query_in_derived_subquery_executes() {
+    let engine = setup_engine();
+    engine
+        .execute("CREATE TABLE docs (id INT, content TEXT)")
+        .expect("create docs");
+    engine
+        .execute("INSERT INTO docs VALUES (1, 'database systems'), (2, 'planner rules')")
+        .expect("insert docs");
+    engine
+        .execute("CREATE INDEX idx_docs_bm25 ON docs USING bm25 (content)")
+        .expect("index");
+
+    let out = engine.execute(
+        "SELECT t.id FROM (SELECT id, content <@ to_bm25query('database', 'idx_docs_bm25') AS score FROM docs) t WHERE t.score > 0",
+    );
+    assert!(out.is_ok(), "derived-subquery bm25 query should execute");
+}

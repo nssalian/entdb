@@ -349,3 +349,76 @@ fn perf_optimizer_cold_start_no_regression_budget() {
         max_overhead_ms
     );
 }
+
+#[test]
+#[ignore = "perf regression test"]
+fn perf_vector_distance_query_budget() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("perf_vector.db");
+    let dm = Arc::new(DiskManager::new(&db_path).expect("disk manager"));
+    let bp = Arc::new(BufferPool::new(256, Arc::clone(&dm)));
+    let catalog = Arc::new(Catalog::init(Arc::clone(&bp)).expect("catalog init"));
+    let engine = QueryEngine::new(catalog);
+
+    engine
+        .execute("CREATE TABLE embeddings (id INT, vec VECTOR(3))")
+        .expect("create");
+    for i in 0..2000_u32 {
+        let x = (i % 100) as f32 / 100.0;
+        let y = ((i + 1) % 100) as f32 / 100.0;
+        let z = ((i + 2) % 100) as f32 / 100.0;
+        let sql = format!("INSERT INTO embeddings VALUES ({i}, '[{x},{y},{z}]')");
+        engine.execute(&sql).expect("insert vector");
+    }
+
+    let start = Instant::now();
+    let out = engine
+        .execute(
+            "SELECT id, vec <-> '[0.1,0.2,0.3]' AS d FROM embeddings WHERE vec <=> '[0.1,0.2,0.3]' < 0.8",
+        )
+        .expect("vector query");
+    let elapsed = start.elapsed();
+    assert_eq!(out.len(), 1);
+    let budget = budget_millis("ENTDB_PERF_VECTOR_QUERY_MAX_MS", 1_500);
+    assert!(elapsed < budget, "vector perf regression: {:?}", elapsed);
+}
+
+#[test]
+#[ignore = "perf regression test"]
+fn perf_bm25_ranked_query_budget() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("perf_bm25.db");
+    let dm = Arc::new(DiskManager::new(&db_path).expect("disk manager"));
+    let bp = Arc::new(BufferPool::new(256, Arc::clone(&dm)));
+    let catalog = Arc::new(Catalog::init(Arc::clone(&bp)).expect("catalog init"));
+    let engine = QueryEngine::new(catalog);
+
+    engine
+        .execute("CREATE TABLE docs (id INT, content TEXT)")
+        .expect("create");
+    for i in 0..3000_u32 {
+        let txt = if i % 3 == 0 {
+            "database indexing retrieval"
+        } else if i % 3 == 1 {
+            "systems design networking"
+        } else {
+            "database systems design"
+        };
+        let sql = format!("INSERT INTO docs VALUES ({i}, '{txt}')");
+        engine.execute(&sql).expect("insert doc");
+    }
+    engine
+        .execute("CREATE INDEX idx_docs_bm25_perf ON docs USING bm25 (content)")
+        .expect("index");
+
+    let start = Instant::now();
+    let out = engine
+        .execute(
+            "SELECT id, content <@ to_bm25query('database systems', 'idx_docs_bm25_perf') AS score FROM docs",
+        )
+        .expect("bm25 query");
+    let elapsed = start.elapsed();
+    assert_eq!(out.len(), 1);
+    let budget = budget_millis("ENTDB_PERF_BM25_QUERY_MAX_MS", 1_800);
+    assert!(elapsed < budget, "bm25 perf regression: {:?}", elapsed);
+}

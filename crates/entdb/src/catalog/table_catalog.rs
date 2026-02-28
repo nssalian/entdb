@@ -44,6 +44,20 @@ pub struct IndexInfo {
     pub root_page_id: PageId,
     pub column_indices: Vec<usize>,
     pub unique: bool,
+    #[serde(default)]
+    pub index_type: IndexType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum IndexType {
+    BTree,
+    Bm25 { text_config: String },
+}
+
+impl Default for IndexType {
+    fn default() -> Self {
+        Self::BTree
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -259,6 +273,7 @@ impl Catalog {
         index_name: &str,
         columns: &[String],
         unique: bool,
+        index_type: IndexType,
     ) -> Result<IndexInfo> {
         let mut tables = self.tables.write();
         let table = tables.get_mut(table_name).ok_or_else(|| {
@@ -298,6 +313,7 @@ impl Catalog {
             root_page_id,
             column_indices,
             unique,
+            index_type,
         };
         table.indexes.push(idx.clone());
         drop(tables);

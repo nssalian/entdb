@@ -35,6 +35,34 @@ Current rewrites:
 - MySQL-style backticks: `` `users` `` -> `"users"`
 - MySQL numeric `LIMIT offset, count` -> `LIMIT count OFFSET offset`
 
+## Vector + BM25 SQL support (server and embedded)
+
+These features are available in both execution paths:
+
+- server path (`entdb-server` via pgwire / `psql`)
+- embedded path (`EntDb::connect` / `db.execute(...)`)
+
+### Vector surface
+
+- `VECTOR(n)` column type
+- vector text literals such as `'[0.1,0.2,0.3]'`
+- operators:
+- `<->` L2 distance
+- `<=>` cosine distance (distance form)
+
+### BM25 text-search surface
+
+- `CREATE INDEX ... USING bm25 (...) [WITH (text_config='english')]`
+- `to_bm25query(query_text, index_name)`
+- `<@` score operator, e.g. `content <@ to_bm25query(...)`
+- BM25 sidecar index files are persisted and maintained on INSERT/UPDATE/DELETE
+- BM25 sidecar files are schema-versioned with legacy unversioned compatibility
+
+Current status:
+
+- SQL surface above is supported in both modes.
+- BM25 planner can route matching `<@ to_bm25query(...)` shapes to an index-backed scan path.
+
 ## Run Server
 
 From crates.io (when `entdb-server` is published):
@@ -106,6 +134,7 @@ fn main() -> entdb::Result<()> {
 ```bash
 ./scripts/run_psql_smoke.sh "host=127.0.0.1 port=5433 user=entdb password=entdb dbname=entdb"
 ./scripts/run_psql_polyglot_smoke.sh "host=127.0.0.1 port=5433 user=entdb password=entdb dbname=entdb"
+./scripts/run_psql_vector_bm25_smoke.sh "host=127.0.0.1 port=5433 user=entdb password=entdb dbname=entdb"
 ```
 
 ## Docs

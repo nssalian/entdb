@@ -517,6 +517,7 @@ fn is_read_plan(plan: &LogicalPlan) -> bool {
         plan,
         LogicalPlan::Values { .. }
             | LogicalPlan::SeqScan { .. }
+            | LogicalPlan::Bm25Scan { .. }
             | LogicalPlan::NestedLoopJoin { .. }
             | LogicalPlan::Union { .. }
             | LogicalPlan::Filter { .. }
@@ -534,6 +535,11 @@ fn plan_signature(plan: &LogicalPlan) -> String {
     match plan {
         LogicalPlan::Values { rows, .. } => format!("Values({})", rows.len()),
         LogicalPlan::SeqScan { table } => format!("SeqScan({})", table.name),
+        LogicalPlan::Bm25Scan {
+            table, index_name, ..
+        } => {
+            format!("Bm25Scan({},{})", table.name, index_name)
+        }
         LogicalPlan::NestedLoopJoin {
             left,
             right,
@@ -594,6 +600,7 @@ fn plan_root_name(plan: &LogicalPlan) -> &'static str {
     match plan {
         LogicalPlan::Values { .. } => "Values",
         LogicalPlan::SeqScan { .. } => "SeqScan",
+        LogicalPlan::Bm25Scan { .. } => "Bm25Scan",
         LogicalPlan::NestedLoopJoin { .. } => "NestedLoopJoin",
         LogicalPlan::Union { .. } => "Union",
         LogicalPlan::Filter { .. } => "Filter",

@@ -67,6 +67,21 @@ Expected result:
   2 | bob
 ```
 
+### 4. Try vector and BM25 SQL (server mode)
+
+Run the following SQL in `psql`:
+
+```sql
+CREATE TABLE embeddings (id INT, vec VECTOR(3));
+INSERT INTO embeddings VALUES (1, '[0.1,0.2,0.3]'), (2, '[0.9,0.8,0.7]');
+SELECT id, vec <-> '[0.2,0.2,0.2]' AS dist FROM embeddings ORDER BY id;
+
+CREATE TABLE docs (id INT, content TEXT);
+INSERT INTO docs VALUES (1, 'database systems'), (2, 'search indexing');
+CREATE INDEX idx_docs_bm25 ON docs USING bm25 (content) WITH (text_config='english');
+SELECT id, content <@ to_bm25query('database', 'idx_docs_bm25') AS score FROM docs ORDER BY id;
+```
+
 ## Path B: Embedded Rust API
 
 Add to `Cargo.toml`:
@@ -85,6 +100,30 @@ fn main() -> entdb::Result<()> {
     db.execute("INSERT INTO users VALUES (1, 'alice')")?;
     let rows = db.execute("SELECT * FROM users")?;
     println!("{rows:?}");
+    db.close()?;
+    Ok(())
+}
+```
+
+### 5. Try vector and BM25 SQL (embedded mode)
+
+Use the same features directly from Rust:
+
+```rust
+use entdb::EntDb;
+
+fn main() -> entdb::Result<()> {
+    let db = EntDb::connect("./entdb_data")?;
+    db.execute("CREATE TABLE embeddings (id INT, vec VECTOR(3))")?;
+    db.execute("INSERT INTO embeddings VALUES (1, '[0.1,0.2,0.3]')")?;
+    db.execute("SELECT id, vec <-> '[0.2,0.2,0.2]' AS dist FROM embeddings")?;
+
+    db.execute("CREATE TABLE docs (id INT, content TEXT)")?;
+    db.execute("INSERT INTO docs VALUES (1, 'database systems')")?;
+    db.execute("CREATE INDEX idx_docs_bm25 ON docs USING bm25 (content)")?;
+    db.execute(
+        "SELECT id, content <@ to_bm25query('database', 'idx_docs_bm25') AS score FROM docs",
+    )?;
     db.close()?;
     Ok(())
 }

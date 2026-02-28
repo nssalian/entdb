@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, IndexType};
 use crate::query::{QueryEngine, QueryOutput};
+use crate::storage::bm25::Bm25Index;
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::disk_manager::DiskManager;
 use crate::types::Value;
@@ -721,6 +722,170 @@ fn create_and_drop_index_sql_path() {
         .execute("DROP INDEX IF EXISTS idx_users_id")
         .expect("drop index if exists");
     assert_eq!(out, vec![QueryOutput::AffectedRows(0)]);
+}
+
+#[test]
+fn create_bm25_index_sql_path_persists_metadata() {
+    let (engine, catalog) = setup_engine_with_catalog();
+    engine
+        .execute("CREATE TABLE docs (id INT, content TEXT)")
+        .expect("create table");
+
+    let out = engine
+        .execute(
+            "CREATE INDEX idx_docs_bm25 ON docs USING bm25 (content) WITH (text_config='english')",
+        )
+        .expect("create bm25 index");
+    assert_eq!(out, vec![QueryOutput::AffectedRows(1)]);
+
+    let table = catalog.get_table("docs").expect("table exists");
+    assert_eq!(table.indexes.len(), 1);
+    assert_eq!(table.indexes[0].name, "idx_docs_bm25");
+    assert_eq!(
+        table.indexes[0].index_type,
+        IndexType::Bm25 {
+            text_config: "english".to_string()
+        }
+    );
+}
+
+#[test]
+fn bm25_function_and_operator_score_rows() {
+    let engine = setup_engine();
+    engine
+        .execute("CREATE TABLE docs (id INT, content TEXT)")
+        .expect("create table");
+    engine
+        .execute(
+            "INSERT INTO docs VALUES \
+             (1, 'database database systems'), \
+             (2, 'systems design'), \
+             (3, 'database indexing retrieval')",
+        )
+        .expect("insert");
+    engine
+        .execute("CREATE INDEX idx_docs_bm25 ON docs USING bm25 (content)")
+        .expect("create bm25 index");
+
+    let out = engine
+        .execute(
+            "SELECT id, content <@ to_bm25query('database', 'idx_docs_bm25') \
+             FROM docs ORDER BY id ASC",
+        )
+        .expect("score query");
+
+    match &out[0] {
+        QueryOutput::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 3);
+            let s1 = match rows[0][1] {
+                Value::Float64(v) => v,
+                _ => panic!("expected float score for row 1"),
+            };
+            let s2 = match rows[1][1] {
+                Value::Float64(v) => v,
+                _ => panic!("expected float score for row 2"),
+            };
+            let s3 = match rows[2][1] {
+                Value::Float64(v) => v,
+                _ => panic!("expected float score for row 3"),
+            };
+            assert!(s1 > s3);
+            assert_eq!(s2, 0.0);
+            assert!(s3 > 0.0);
+        }
+        _ => panic!("expected rows"),
+    }
+}
+
+#[test]
+fn bm25_sidecar_builds_on_create_index_and_tracks_dml() {
+    let (engine, catalog) = setup_engine_with_catalog();
+    engine
+        .execute("CREATE TABLE docs (id INT, content TEXT)")
+        .expect("create table");
+    engine
+        .execute("INSERT INTO docs VALUES (1, 'database systems'), (2, 'search indexing')")
+        .expect("seed rows");
+
+    engine
+        .execute("CREATE INDEX idx_docs_bm25_track ON docs USING bm25 (content)")
+        .expect("create bm25 index");
+
+    let db_path = catalog.buffer_pool().disk_path().to_path_buf();
+    let mut bm = Bm25Index::load(&db_path, "idx_docs_bm25_track").expect("load bm25 sidecar");
+    assert_eq!(bm.document_count(), 2);
+    assert_eq!(bm.document_frequency("database"), 1);
+
+    engine
+        .execute("INSERT INTO docs VALUES (3, 'database retrieval')")
+        .expect("insert doc");
+    bm = Bm25Index::load(&db_path, "idx_docs_bm25_track").expect("reload sidecar");
+    assert_eq!(bm.document_count(), 3);
+    assert_eq!(bm.document_frequency("database"), 2);
+
+    engine
+        .execute("UPDATE docs SET content = 'updated corpus' WHERE id = 1")
+        .expect("update doc");
+    bm = Bm25Index::load(&db_path, "idx_docs_bm25_track").expect("reload sidecar");
+    assert_eq!(bm.document_count(), 3);
+    assert_eq!(bm.document_frequency("database"), 1);
+
+    engine
+        .execute("DELETE FROM docs WHERE id = 3")
+        .expect("delete doc");
+    bm = Bm25Index::load(&db_path, "idx_docs_bm25_track").expect("reload sidecar");
+    assert_eq!(bm.document_count(), 2);
+    assert_eq!(bm.document_frequency("database"), 0);
+}
+
+#[test]
+fn bm25_query_uses_bm25_scan_plan_signature_when_index_matches() {
+    let engine = setup_engine();
+    engine
+        .execute("CREATE TABLE docs (id INT, content TEXT)")
+        .expect("create table");
+    engine
+        .execute("INSERT INTO docs VALUES (1, 'database systems')")
+        .expect("insert");
+    engine
+        .execute("CREATE INDEX idx_docs_bm25 ON docs USING bm25 (content)")
+        .expect("create index");
+
+    let traces = engine
+        .explain_optimizer_trace(
+            "SELECT id, content <@ to_bm25query('database', 'idx_docs_bm25') FROM docs",
+        )
+        .expect("trace");
+    let chosen = traces[0]
+        .chosen_plan_signature
+        .clone()
+        .expect("chosen signature");
+    assert!(chosen.contains("Bm25Scan("), "signature was: {chosen}");
+}
+
+#[test]
+fn bm25_query_falls_back_when_index_name_is_unknown() {
+    let engine = setup_engine();
+    engine
+        .execute("CREATE TABLE docs (id INT, content TEXT)")
+        .expect("create table");
+    engine
+        .execute("INSERT INTO docs VALUES (1, 'database systems')")
+        .expect("insert");
+    engine
+        .execute("CREATE INDEX idx_docs_bm25 ON docs USING bm25 (content)")
+        .expect("create index");
+
+    let traces = engine
+        .explain_optimizer_trace(
+            "SELECT id, content <@ to_bm25query('database', 'missing_idx') FROM docs",
+        )
+        .expect("trace");
+    let chosen = traces[0]
+        .chosen_plan_signature
+        .clone()
+        .expect("chosen signature");
+    assert!(chosen.contains("SeqScan("), "signature was: {chosen}");
 }
 
 #[test]

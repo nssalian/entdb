@@ -16,6 +16,7 @@
 
 use crate::catalog::{Catalog, Schema, TableInfo};
 use crate::error::{EntDbError, Result};
+use crate::query::executor::bm25_maintenance;
 use crate::query::executor::{
     decode_stored_row, encode_mvcc_row, row_visible, DecodedRow, Executor, MvccRow,
     TxExecutionContext,
@@ -148,11 +149,27 @@ impl Executor for UpdateExecutor {
                     self.table_info.name, tid
                 )));
             }
-            table.insert(&Tuple::new(encode_mvcc_row(&MvccRow {
+            let inserted_tid = table.insert(&Tuple::new(encode_mvcc_row(&MvccRow {
                 values: updated_row,
                 created_txn: this_txn,
                 deleted_txn: None,
             })?))?;
+            bm25_maintenance::on_delete(&self.catalog, &self.table_info, tid)?;
+            let inserted_tuple = table.get(inserted_tid)?;
+            let inserted_version = match decode_stored_row(&inserted_tuple.data)? {
+                DecodedRow::Legacy(values) => MvccRow {
+                    values,
+                    created_txn: 0,
+                    deleted_txn: None,
+                },
+                DecodedRow::Versioned(v) => v,
+            };
+            bm25_maintenance::on_insert(
+                &self.catalog,
+                &self.table_info,
+                &inserted_version.values,
+                inserted_tid,
+            )?;
             self.affected_rows = self.affected_rows.saturating_add(1);
         }
 

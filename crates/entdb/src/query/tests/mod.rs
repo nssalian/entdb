@@ -26,3 +26,4 @@ mod optimizer_introspection_tests;
 mod optimizer_tests;
 mod polyglot_tests;
 mod property_tests;
+mod vector_tests;

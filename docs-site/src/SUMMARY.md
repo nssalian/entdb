@@ -2,6 +2,7 @@
 
 - [Introduction](./introduction.md)
 - [Quickstart](./quickstart.md)
+- [Search and Vectors](./search-and-vectors.md)
 - [Architecture](./architecture.md)
 - [Storage Engine](./storage.md)
 - [SQL and Query Engine](./query.md)

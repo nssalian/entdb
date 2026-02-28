@@ -16,6 +16,8 @@
 
 pub mod alter_table;
 pub mod analyze;
+pub mod bm25_maintenance;
+pub mod bm25_scan;
 pub mod count;
 pub mod create_index;
 pub mod create_table;
@@ -82,6 +84,19 @@ pub fn build_executor(plan: &LogicalPlan, ctx: &ExecutionContext) -> Result<Box<
         ))),
         LogicalPlan::SeqScan { table } => Ok(Box::new(seq_scan::SeqScanExecutor::new(
             table.clone(),
+            Arc::clone(&ctx.catalog),
+            ctx.tx.clone(),
+        ))),
+        LogicalPlan::Bm25Scan {
+            table,
+            index_name,
+            terms,
+            output_schema,
+        } => Ok(Box::new(bm25_scan::Bm25ScanExecutor::new(
+            table.clone(),
+            index_name.clone(),
+            terms.clone(),
+            output_schema.clone(),
             Arc::clone(&ctx.catalog),
             ctx.tx.clone(),
         ))),
@@ -305,12 +320,14 @@ pub fn build_executor(plan: &LogicalPlan, ctx: &ExecutionContext) -> Result<Box<
             columns,
             unique,
             if_not_exists,
+            index_type,
         } => Ok(Box::new(create_index::CreateIndexExecutor::new(
             table_name.clone(),
             index_name.clone(),
             columns.clone(),
             *unique,
             *if_not_exists,
+            index_type.clone(),
             Arc::clone(&ctx.catalog),
         ))),
         LogicalPlan::DropIndex {

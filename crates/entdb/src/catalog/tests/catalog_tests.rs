@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use crate::catalog::{Catalog, Column, Schema};
+use crate::catalog::{Catalog, Column, IndexType, Schema};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::disk_manager::DiskManager;
 use crate::types::DataType;
@@ -53,10 +53,17 @@ fn catalog_create_index_persist_reload() {
     assert_eq!(users.name, "users");
 
     let idx = catalog
-        .create_index("users", "idx_users_id", &["id".to_string()], true)
+        .create_index(
+            "users",
+            "idx_users_id",
+            &["id".to_string()],
+            true,
+            IndexType::BTree,
+        )
         .expect("create index");
     assert_eq!(idx.name, "idx_users_id");
     assert_eq!(idx.column_indices, vec![0]);
+    assert_eq!(idx.index_type, IndexType::BTree);
 
     drop(catalog);
     drop(bp);
@@ -70,6 +77,62 @@ fn catalog_create_index_persist_reload() {
     assert_eq!(table.schema, schema);
     assert_eq!(table.indexes.len(), 1);
     assert_eq!(table.indexes[0].name, "idx_users_id");
+    assert_eq!(table.indexes[0].index_type, IndexType::BTree);
+}
+
+#[test]
+fn catalog_create_bm25_index_persist_reload() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("cat_bm25.db");
+
+    let dm = Arc::new(DiskManager::new(&db_path).expect("disk manager"));
+    let bp = Arc::new(BufferPool::new(16, Arc::clone(&dm)));
+    let catalog = Catalog::init(Arc::clone(&bp)).expect("init catalog");
+
+    let schema = Schema::new(vec![
+        Column {
+            name: "id".to_string(),
+            data_type: DataType::Int32,
+            nullable: false,
+            default: None,
+            primary_key: true,
+        },
+        Column {
+            name: "content".to_string(),
+            data_type: DataType::Text,
+            nullable: false,
+            default: None,
+            primary_key: false,
+        },
+    ]);
+    catalog.create_table("docs", schema).expect("create docs");
+    catalog
+        .create_index(
+            "docs",
+            "idx_docs_bm25",
+            &["content".to_string()],
+            false,
+            IndexType::Bm25 {
+                text_config: "english".to_string(),
+            },
+        )
+        .expect("create bm25 index");
+
+    drop(catalog);
+    drop(bp);
+    drop(dm);
+
+    let dm2 = Arc::new(DiskManager::new(&db_path).expect("reopen disk manager"));
+    let bp2 = Arc::new(BufferPool::new(16, Arc::clone(&dm2)));
+    let loaded = Catalog::load(Arc::clone(&bp2)).expect("load catalog");
+    let table = loaded.get_table("docs").expect("table exists");
+    assert_eq!(table.indexes.len(), 1);
+    assert_eq!(
+        table.indexes[0].index_type,
+        IndexType::Bm25 {
+            text_config: "english".to_string()
+        }
+    );
 }
 
 #[test]
@@ -130,7 +193,13 @@ fn catalog_drop_index_and_alter_schema_ops() {
         .create_table("users", schema)
         .expect("create users table");
     catalog
-        .create_index("users", "idx_users_id", &["id".to_string()], true)
+        .create_index(
+            "users",
+            "idx_users_id",
+            &["id".to_string()],
+            true,
+            IndexType::BTree,
+        )
         .expect("create index");
     assert!(catalog.drop_index("idx_users_id").expect("drop index"));
 

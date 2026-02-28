@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use crate::catalog::{Catalog, Column, Schema, TableInfo};
+use crate::catalog::{Catalog, Column, IndexType, Schema, TableInfo};
 use crate::error::{EntDbError, Result};
 use crate::query::expression::{BinaryOp, BoundExpr};
 use crate::query::plan::{
@@ -116,6 +116,7 @@ pub enum BoundStatement {
         columns: Vec<String>,
         unique: bool,
         if_not_exists: bool,
+        index_type: IndexType,
     },
     DropIndex {
         index_name: String,
@@ -428,6 +429,7 @@ impl Binder {
                     columns,
                     unique: create_idx.unique,
                     if_not_exists: create_idx.if_not_exists,
+                    index_type: bind_index_type(create_idx)?,
                 })
             }
             Statement::Drop {
@@ -1594,7 +1596,20 @@ fn bind_expr(expr: &Expr, scope: &[ScopeColumn]) -> Result<BoundExpr> {
                 BinaryOperator::Divide => BinaryOp::Div,
                 BinaryOperator::And => BinaryOp::And,
                 BinaryOperator::Or => BinaryOp::Or,
-                _ => return Err(EntDbError::Query("unsupported binary operator".to_string())),
+                BinaryOperator::LtDashGt => BinaryOp::L2Distance,
+                BinaryOperator::Spaceship => BinaryOp::CosineDistance,
+                BinaryOperator::ArrowAt => BinaryOp::Bm25Score,
+                _ => match op.to_string().as_str() {
+                    "<->" => BinaryOp::L2Distance,
+                    "<=>" => BinaryOp::CosineDistance,
+                    "<@>" => BinaryOp::Bm25Score,
+                    _ => {
+                        return Err(EntDbError::Query(format!(
+                            "unsupported binary operator '{}'",
+                            op
+                        )))
+                    }
+                },
             };
 
             let l = bind_expr(left, scope)?;
@@ -1707,12 +1722,18 @@ fn infer_expr_type(expr: &BoundExpr, input_schema: &Schema) -> DataType {
             .map(|c| c.data_type.clone())
             .unwrap_or(DataType::Null),
         BoundExpr::Literal(v) => v.data_type(),
-        BoundExpr::BinaryOp { .. } => DataType::Null,
+        BoundExpr::BinaryOp { op, .. } => match op {
+            BinaryOp::L2Distance | BinaryOp::CosineDistance | BinaryOp::Bm25Score => {
+                DataType::Float64
+            }
+            _ => DataType::Null,
+        },
         BoundExpr::Function { name, .. } => match name.as_str() {
             "length" => DataType::Int64,
             "upper" | "lower" | "trim" | "concat" => DataType::Text,
             "abs" => DataType::Float64,
             "coalesce" => DataType::Null,
+            "to_bm25query" => DataType::Bm25Query,
             _ => DataType::Null,
         },
         BoundExpr::WindowRowNumber { .. } => DataType::Int64,
@@ -1841,7 +1862,80 @@ fn map_sql_type(dt: &sqlparser::ast::DataType) -> Result<DataType> {
             .unwrap_or(255),
         )),
         D::Timestamp(_, _) => Ok(DataType::Timestamp),
-        _ => Err(EntDbError::Query(format!("unsupported SQL type: {dt:?}"))),
+        _ => parse_vector_data_type(dt)
+            .ok_or_else(|| EntDbError::Query(format!("unsupported SQL type: {dt:?}"))),
+    }
+}
+
+fn parse_vector_data_type(dt: &sqlparser::ast::DataType) -> Option<DataType> {
+    let text = dt.to_string();
+    let normalized = text.trim().to_ascii_lowercase();
+    if !normalized.starts_with("vector(") || !normalized.ends_with(')') {
+        return None;
+    }
+    let inner = &normalized["vector(".len()..normalized.len() - 1];
+    let dim = inner.trim().parse::<u32>().ok()?;
+    Some(DataType::Vector(dim))
+}
+
+fn bind_index_type(create_idx: &sqlparser::ast::CreateIndex) -> Result<IndexType> {
+    let method = create_idx
+        .using
+        .as_ref()
+        .map(|i| i.value.to_ascii_lowercase())
+        .unwrap_or_else(|| "btree".to_string());
+
+    match method.as_str() {
+        "btree" => Ok(IndexType::BTree),
+        "bm25" => {
+            let mut text_config = "english".to_string();
+            for expr in &create_idx.with {
+                let Expr::BinaryOp { left, op, right } = expr else {
+                    continue;
+                };
+                if !matches!(op, BinaryOperator::Eq) {
+                    continue;
+                }
+                let Expr::Identifier(key) = left.as_ref() else {
+                    continue;
+                };
+                if !key.value.eq_ignore_ascii_case("text_config") {
+                    continue;
+                }
+                match right.as_ref() {
+                    Expr::Value(v) => match &v.value {
+                        sqlparser::ast::Value::SingleQuotedString(s)
+                        | sqlparser::ast::Value::DoubleQuotedString(s) => {
+                            text_config = s.clone();
+                        }
+                        _ => {
+                            return Err(EntDbError::Query(
+                                "bm25 text_config must be a string literal".to_string(),
+                            ))
+                        }
+                    },
+                    _ => {
+                        return Err(EntDbError::Query(
+                            "bm25 text_config must be a string literal".to_string(),
+                        ))
+                    }
+                }
+            }
+            if !matches!(
+                text_config.to_ascii_lowercase().as_str(),
+                "english" | "simple"
+            ) {
+                return Err(EntDbError::Query(format!(
+                    "unsupported bm25 text_config '{}'; supported values: english, simple",
+                    text_config
+                )));
+            }
+            Ok(IndexType::Bm25 { text_config })
+        }
+        _ => Err(EntDbError::Query(format!(
+            "unsupported index method '{}'",
+            method
+        ))),
     }
 }
 

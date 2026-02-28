@@ -16,6 +16,7 @@
 
 use crate::catalog::{Catalog, Schema, TableInfo};
 use crate::error::{EntDbError, Result};
+use crate::query::executor::bm25_maintenance;
 use crate::query::executor::{
     decode_stored_row, encode_mvcc_row, row_visible, DecodedRow, Executor, MvccRow,
     TxExecutionContext,
@@ -135,6 +136,7 @@ impl Executor for DeleteExecutor {
                     self.table_info.name, tid
                 )));
             }
+            bm25_maintenance::on_delete(&self.catalog, &self.table_info, tid)?;
             self.affected_rows = self.affected_rows.saturating_add(1);
         }
 

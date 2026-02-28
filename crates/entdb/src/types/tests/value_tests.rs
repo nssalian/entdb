@@ -27,6 +27,14 @@ fn value_round_trip_serialize_deserialize() {
         (Value::Float64(2.5), DataType::Float64),
         (Value::Text("ent".to_string()), DataType::Text),
         (Value::Timestamp(1_700_000_000), DataType::Timestamp),
+        (Value::Vector(vec![0.1, 0.2, 0.3]), DataType::Vector(3)),
+        (
+            Value::Bm25Query {
+                terms: vec!["database".to_string(), "search".to_string()],
+                index_name: "idx_docs".to_string(),
+            },
+            DataType::Bm25Query,
+        ),
     ];
 
     for (v, dt) in cases {
@@ -89,4 +97,23 @@ fn value_text_to_timestamp_cast_supports_common_formats() {
         .cast_to(&DataType::Timestamp)
         .expect("cast rfc3339 timestamp");
     assert_eq!(ts_rfc3339, Value::Timestamp(1_704_067_200));
+}
+
+#[test]
+fn value_text_vector_cast_round_trip() {
+    let v = Value::Text("[1.0, 2.5,3]".to_string())
+        .cast_to(&DataType::Vector(3))
+        .expect("cast text->vector");
+    assert_eq!(v, Value::Vector(vec![1.0, 2.5, 3.0]));
+
+    let text = v.cast_to(&DataType::Text).expect("cast vector->text");
+    assert_eq!(text, Value::Text("[1,2.5,3]".to_string()));
+}
+
+#[test]
+fn value_vector_cast_dimension_mismatch_fails() {
+    let err = Value::Text("[1,2]".to_string())
+        .cast_to(&DataType::Vector(3))
+        .expect_err("dimension mismatch should fail");
+    assert!(err.to_string().contains("vector dimension mismatch"));
 }

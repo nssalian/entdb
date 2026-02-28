@@ -16,6 +16,7 @@
 
 use crate::error::{EntDbError, Result};
 use crate::query::plan::SortKey;
+use crate::types::value::parse_vector_text;
 use crate::types::Value;
 
 #[derive(Debug, Clone)]
@@ -52,6 +53,9 @@ pub enum BinaryOp {
     Div,
     And,
     Or,
+    L2Distance,
+    CosineDistance,
+    Bm25Score,
 }
 
 pub fn eval_expr(expr: &BoundExpr, row: &[Value]) -> Result<Value> {
@@ -78,6 +82,9 @@ pub fn eval_expr(expr: &BoundExpr, row: &[Value]) -> Result<Value> {
                 BinaryOp::Div => eval_div(&l, &r),
                 BinaryOp::And => eval_and(&l, &r),
                 BinaryOp::Or => eval_or(&l, &r),
+                BinaryOp::L2Distance => eval_l2_distance(&l, &r),
+                BinaryOp::CosineDistance => eval_cosine_distance(&l, &r),
+                BinaryOp::Bm25Score => eval_bm25_score(&l, &r),
             }
         }
         BoundExpr::Function { name, args } => eval_function(name, args, row),
@@ -214,6 +221,130 @@ fn eval_or(left: &Value, right: &Value) -> Result<Value> {
     }
 }
 
+fn eval_l2_distance(left: &Value, right: &Value) -> Result<Value> {
+    let (l, r) = coerce_vectors(left, right)?;
+    let mut sum = 0_f64;
+    for (a, b) in l.iter().zip(r.iter()) {
+        let d = (*a as f64) - (*b as f64);
+        sum += d * d;
+    }
+    Ok(Value::Float64(sum.sqrt()))
+}
+
+fn eval_cosine_distance(left: &Value, right: &Value) -> Result<Value> {
+    let (l, r) = coerce_vectors(left, right)?;
+    let mut dot = 0_f64;
+    let mut ll = 0_f64;
+    let mut rr = 0_f64;
+    for (a, b) in l.iter().zip(r.iter()) {
+        let af = *a as f64;
+        let bf = *b as f64;
+        dot += af * bf;
+        ll += af * af;
+        rr += bf * bf;
+    }
+    if ll == 0.0 || rr == 0.0 {
+        return Err(EntDbError::Query(
+            "cosine distance undefined for zero vector".to_string(),
+        ));
+    }
+    Ok(Value::Float64(1.0 - (dot / (ll.sqrt() * rr.sqrt()))))
+}
+
+fn coerce_vectors<'a>(left: &'a Value, right: &'a Value) -> Result<(Vec<f32>, Vec<f32>)> {
+    let l = match left {
+        Value::Vector(v) => v.clone(),
+        Value::Text(s) => parse_vector_text(s)
+            .map_err(|e| EntDbError::Query(format!("invalid vector literal: {e}")))?,
+        _ => {
+            return Err(EntDbError::Query(format!(
+                "vector operator requires VECTOR/TEXT operands, got {:?}",
+                left.data_type()
+            )))
+        }
+    };
+    let r = match right {
+        Value::Vector(v) => v.clone(),
+        Value::Text(s) => parse_vector_text(s)
+            .map_err(|e| EntDbError::Query(format!("invalid vector literal: {e}")))?,
+        _ => {
+            return Err(EntDbError::Query(format!(
+                "vector operator requires VECTOR/TEXT operands, got {:?}",
+                right.data_type()
+            )))
+        }
+    };
+
+    if l.len() != r.len() {
+        return Err(EntDbError::Query(format!(
+            "vector dimension mismatch: {} vs {}",
+            l.len(),
+            r.len()
+        )));
+    }
+
+    Ok((l, r))
+}
+
+fn eval_bm25_score(left: &Value, right: &Value) -> Result<Value> {
+    let text = match left {
+        Value::Text(s) => s.as_str(),
+        Value::Null => return Ok(Value::Float64(0.0)),
+        _ => {
+            return Err(EntDbError::Query(format!(
+                "bm25 operator requires TEXT on left operand, got {:?}",
+                left.data_type()
+            )))
+        }
+    };
+
+    let terms = match right {
+        Value::Bm25Query { terms, .. } => terms.clone(),
+        Value::Null => return Ok(Value::Float64(0.0)),
+        Value::Text(s) => tokenize(s),
+        _ => {
+            return Err(EntDbError::Query(format!(
+                "bm25 operator requires BM25 query on right operand, got {:?}",
+                right.data_type()
+            )))
+        }
+    };
+
+    if terms.is_empty() {
+        return Ok(Value::Float64(0.0));
+    }
+
+    let doc_terms = tokenize(text);
+    if doc_terms.is_empty() {
+        return Ok(Value::Float64(0.0));
+    }
+
+    // Lightweight BM25-like scoring over the current document.
+    let k1 = 1.2_f64;
+    let b = 0.75_f64;
+    let dl = doc_terms.len() as f64;
+    let avgdl = dl.max(1.0);
+    let mut score = 0.0_f64;
+    for term in terms {
+        let tf = doc_terms.iter().filter(|t| *t == &term).count() as f64;
+        if tf == 0.0 {
+            continue;
+        }
+        let denom = tf + k1 * (1.0 - b + b * dl / avgdl);
+        score += (tf * (k1 + 1.0)) / denom;
+    }
+
+    Ok(Value::Float64(score))
+}
+
+fn tokenize(input: &str) -> Vec<String> {
+    input
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
+}
+
 fn eval_function(name: &str, args: &[BoundExpr], row: &[Value]) -> Result<Value> {
     let mut vals = Vec::with_capacity(args.len());
     for arg in args {
@@ -250,6 +381,33 @@ fn eval_function(name: &str, args: &[BoundExpr], row: &[Value]) -> Result<Value>
                 }
             }
             Ok(Value::Null)
+        }
+        "to_bm25query" => {
+            if vals.len() != 2 {
+                return Err(EntDbError::Query(
+                    "to_bm25query expects 2 arguments".to_string(),
+                ));
+            }
+            let query = match &vals[0] {
+                Value::Text(s) => s.clone(),
+                _ => {
+                    return Err(EntDbError::Query(
+                        "to_bm25query first argument must be TEXT".to_string(),
+                    ))
+                }
+            };
+            let index_name = match &vals[1] {
+                Value::Text(s) => s.clone(),
+                _ => {
+                    return Err(EntDbError::Query(
+                        "to_bm25query second argument must be TEXT".to_string(),
+                    ))
+                }
+            };
+            Ok(Value::Bm25Query {
+                terms: tokenize(&query),
+                index_name,
+            })
         }
         _ => Err(EntDbError::Query(format!("unsupported function '{name}'"))),
     }

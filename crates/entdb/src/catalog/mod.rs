@@ -22,4 +22,4 @@ pub mod table_catalog;
 mod tests;
 
 pub use schema::{Column, Schema};
-pub use table_catalog::{Catalog, ColumnStats, IndexInfo, TableInfo, TableStats};
+pub use table_catalog::{Catalog, ColumnStats, IndexInfo, IndexType, TableInfo, TableStats};

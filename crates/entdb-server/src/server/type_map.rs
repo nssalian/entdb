@@ -15,6 +15,7 @@
  */
 
 use entdb::error::{EntDbError, Result};
+use entdb::types::value::{format_vector_text, parse_vector_text};
 use entdb::types::{DataType, Value};
 use pgwire::api::results::{DataRowEncoder, FieldFormat};
 use pgwire::api::Type;
@@ -31,6 +32,8 @@ pub fn ent_to_pg_type(dt: &DataType) -> Type {
         DataType::Text => Type::TEXT,
         DataType::Varchar(_) => Type::VARCHAR,
         DataType::Timestamp => Type::TIMESTAMP,
+        DataType::Vector(_) => Type::TEXT,
+        DataType::Bm25Query => Type::TEXT,
         DataType::Null => Type::UNKNOWN,
     }
 }
@@ -46,6 +49,12 @@ pub fn value_to_text(val: &Value) -> Option<String> {
         Value::Float64(v) => Some(v.to_string()),
         Value::Text(v) => Some(v.clone()),
         Value::Timestamp(v) => Some(v.to_string()),
+        Value::Vector(v) => Some(format_vector_text(v)),
+        Value::Bm25Query { terms, index_name } => Some(format!(
+            "bm25query(index={},terms={})",
+            index_name,
+            terms.join(" ")
+        )),
     }
 }
 
@@ -60,6 +69,10 @@ pub fn value_to_binary(val: &Value) -> Option<Vec<u8>> {
         Value::Float64(v) => Some(v.to_be_bytes().to_vec()),
         Value::Text(v) => Some(v.as_bytes().to_vec()),
         Value::Timestamp(v) => Some(v.to_be_bytes().to_vec()),
+        Value::Vector(v) => Some(format_vector_text(v).into_bytes()),
+        Value::Bm25Query { terms, index_name } => {
+            Some(format!("bm25query(index={},terms={})", index_name, terms.join(" ")).into_bytes())
+        }
     }
 }
 
@@ -94,7 +107,22 @@ pub fn text_to_value(text: &str, dt: &DataType) -> Result<Value> {
             .parse::<i64>()
             .map(Value::Timestamp)
             .map_err(|e| EntDbError::Query(format!("invalid TIMESTAMP literal: {e}"))),
+        DataType::Vector(dim) => {
+            let parsed = parse_vector_text(text)
+                .map_err(|e| EntDbError::Query(format!("invalid VECTOR literal: {e}")))?;
+            if parsed.len() != *dim as usize {
+                return Err(EntDbError::Query(format!(
+                    "invalid VECTOR literal: expected dimension {}, got {}",
+                    dim,
+                    parsed.len()
+                )));
+            }
+            Ok(Value::Vector(parsed))
+        }
         DataType::Null => Ok(Value::Null),
+        DataType::Bm25Query => Err(EntDbError::Query(
+            "BM25 query values are not supported as direct client literals".to_string(),
+        )),
     }
 }
 
@@ -125,6 +153,14 @@ pub fn encode_value(
             let text = v.to_string();
             encoder.encode_field_with_type_and_format(&Some(text), data_type, format)
         }
+        Value::Vector(v) => {
+            let text = format_vector_text(v);
+            encoder.encode_field_with_type_and_format(&Some(text), data_type, format)
+        }
+        Value::Bm25Query { terms, index_name } => {
+            let text = format!("bm25query(index={},terms={})", index_name, terms.join(" "));
+            encoder.encode_field_with_type_and_format(&Some(text), data_type, format)
+        }
     }
 }
 
@@ -145,6 +181,7 @@ mod tests {
         assert_eq!(ent_to_pg_type(&DataType::Text), Type::TEXT);
         assert_eq!(ent_to_pg_type(&DataType::Varchar(64)), Type::VARCHAR);
         assert_eq!(ent_to_pg_type(&DataType::Timestamp), Type::TIMESTAMP);
+        assert_eq!(ent_to_pg_type(&DataType::Vector(3)), Type::TEXT);
     }
 
     #[test]
@@ -157,6 +194,11 @@ mod tests {
             ("1.5", DataType::Float64, Value::Float64(1.5)),
             ("ent", DataType::Text, Value::Text("ent".to_string())),
             ("99", DataType::Timestamp, Value::Timestamp(99)),
+            (
+                "[0.1,0.2,0.3]",
+                DataType::Vector(3),
+                Value::Vector(vec![0.1, 0.2, 0.3]),
+            ),
         ];
 
         for (input, dt, expected) in cases {

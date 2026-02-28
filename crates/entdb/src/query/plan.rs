@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use crate::catalog::IndexType;
 use crate::catalog::{Column, Schema, TableInfo};
 use crate::query::expression::BoundExpr;
 use crate::types::DataType;
@@ -95,6 +96,12 @@ pub enum LogicalPlan {
     },
     SeqScan {
         table: TableInfo,
+    },
+    Bm25Scan {
+        table: TableInfo,
+        index_name: String,
+        terms: Vec<String>,
+        output_schema: Schema,
     },
     NestedLoopJoin {
         left: Box<LogicalPlan>,
@@ -210,6 +217,7 @@ pub enum LogicalPlan {
         columns: Vec<String>,
         unique: bool,
         if_not_exists: bool,
+        index_type: IndexType,
     },
     DropIndex {
         index_name: String,

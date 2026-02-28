@@ -17,6 +17,7 @@
 use crate::catalog::{Column, Schema};
 use crate::error::Result;
 use crate::query::binder::{BoundSource, BoundStatement};
+use crate::query::expression::{BinaryOp, BoundExpr};
 use crate::query::plan::{AggregateExpr, AggregateFn, GroupKey, LogicalPlan};
 
 pub struct Planner;
@@ -27,15 +28,44 @@ impl Planner {
             BoundStatement::Select {
                 source,
                 projection,
-                projection_exprs,
+                mut projection_exprs,
                 projection_names,
-                filter,
+                mut filter,
                 order_by,
                 limit,
                 offset,
                 aggregate,
             } => {
                 let mut plan = self.source_to_plan(source)?;
+                if let LogicalPlan::SeqScan { table } = &plan {
+                    if let Some(spec) =
+                        detect_bm25_spec(projection_exprs.as_deref(), filter.as_ref())
+                    {
+                        if bm25_index_matches_table(table, &spec) {
+                            let score_col_idx = table.schema.columns.len();
+                            if let Some(exprs) = projection_exprs.as_mut() {
+                                rewrite_exprs_to_bm25_score(exprs, &spec, score_col_idx);
+                            }
+                            if let Some(pred) = filter.as_mut() {
+                                rewrite_expr_to_bm25_score(pred, &spec, score_col_idx);
+                            }
+                            let mut out_cols = table.schema.columns.clone();
+                            out_cols.push(Column {
+                                name: "__bm25_score".to_string(),
+                                data_type: crate::types::DataType::Float64,
+                                nullable: false,
+                                default: None,
+                                primary_key: false,
+                            });
+                            plan = LogicalPlan::Bm25Scan {
+                                table: table.clone(),
+                                index_name: spec.index_name,
+                                terms: spec.terms,
+                                output_schema: Schema { columns: out_cols },
+                            };
+                        }
+                    }
+                }
 
                 if let Some(predicate) = filter {
                     plan = LogicalPlan::Filter {
@@ -280,12 +310,14 @@ impl Planner {
                 columns,
                 unique,
                 if_not_exists,
+                index_type,
             } => Ok(LogicalPlan::CreateIndex {
                 table_name,
                 index_name,
                 columns,
                 unique,
                 if_not_exists,
+                index_type,
             }),
             BoundStatement::DropIndex {
                 index_name,
@@ -359,6 +391,7 @@ fn plan_output_schema(plan: &LogicalPlan) -> &Schema {
     match plan {
         LogicalPlan::Values { output_schema, .. } => output_schema,
         LogicalPlan::SeqScan { table } => &table.schema,
+        LogicalPlan::Bm25Scan { output_schema, .. } => output_schema,
         LogicalPlan::NestedLoopJoin { output_schema, .. } => output_schema,
         LogicalPlan::Union { output_schema, .. } => output_schema,
         LogicalPlan::Filter { child, .. } => plan_output_schema(child),
@@ -384,6 +417,135 @@ fn plan_output_schema(plan: &LogicalPlan) -> &Schema {
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::AlterTable { .. } => panic!("non-row plan has no schema"),
     }
+}
+
+#[derive(Clone)]
+struct Bm25PlanSpec {
+    col_idx: usize,
+    index_name: String,
+    terms: Vec<String>,
+}
+
+fn detect_bm25_spec(
+    projection_exprs: Option<&[crate::query::expression::BoundExpr]>,
+    filter: Option<&crate::query::expression::BoundExpr>,
+) -> Option<Bm25PlanSpec> {
+    if let Some(exprs) = projection_exprs {
+        for expr in exprs {
+            if let Some(spec) = extract_bm25_spec(expr) {
+                return Some(spec);
+            }
+        }
+    }
+    filter.and_then(extract_bm25_spec)
+}
+
+fn extract_bm25_spec(expr: &crate::query::expression::BoundExpr) -> Option<Bm25PlanSpec> {
+    match expr {
+        crate::query::expression::BoundExpr::BinaryOp { op, left, right } => {
+            if matches!(op, BinaryOp::Bm25Score) {
+                let BoundExpr::ColumnRef { col_idx } = left.as_ref() else {
+                    return None;
+                };
+                if let Some((terms, index_name)) = extract_bm25_query_args(right) {
+                    return Some(Bm25PlanSpec {
+                        col_idx: *col_idx,
+                        index_name,
+                        terms,
+                    });
+                }
+            }
+            extract_bm25_spec(left).or_else(|| extract_bm25_spec(right))
+        }
+        crate::query::expression::BoundExpr::Function { args, .. } => {
+            for arg in args {
+                if let Some(spec) = extract_bm25_spec(arg) {
+                    return Some(spec);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn extract_bm25_query_args(
+    expr: &crate::query::expression::BoundExpr,
+) -> Option<(Vec<String>, String)> {
+    let crate::query::expression::BoundExpr::Function { name, args } = expr else {
+        return None;
+    };
+    if name != "to_bm25query" || args.len() != 2 {
+        return None;
+    }
+    let crate::query::expression::BoundExpr::Literal(crate::types::Value::Text(query)) = &args[0]
+    else {
+        return None;
+    };
+    let crate::query::expression::BoundExpr::Literal(crate::types::Value::Text(index_name)) =
+        &args[1]
+    else {
+        return None;
+    };
+    let terms = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    Some((terms, index_name.clone()))
+}
+
+fn rewrite_exprs_to_bm25_score(
+    exprs: &mut [crate::query::expression::BoundExpr],
+    spec: &Bm25PlanSpec,
+    score_col_idx: usize,
+) {
+    for expr in exprs {
+        rewrite_expr_to_bm25_score(expr, spec, score_col_idx);
+    }
+}
+
+fn rewrite_expr_to_bm25_score(
+    expr: &mut crate::query::expression::BoundExpr,
+    spec: &Bm25PlanSpec,
+    score_col_idx: usize,
+) {
+    match expr {
+        crate::query::expression::BoundExpr::BinaryOp { op, left, right } => {
+            if matches!(op, BinaryOp::Bm25Score)
+                && matches!(left.as_ref(), BoundExpr::ColumnRef { col_idx } if *col_idx == spec.col_idx)
+                && matches_bm25_query(right, spec)
+            {
+                *expr = BoundExpr::ColumnRef {
+                    col_idx: score_col_idx,
+                };
+                return;
+            }
+            rewrite_expr_to_bm25_score(left, spec, score_col_idx);
+            rewrite_expr_to_bm25_score(right, spec, score_col_idx);
+        }
+        crate::query::expression::BoundExpr::Function { args, .. } => {
+            for arg in args {
+                rewrite_expr_to_bm25_score(arg, spec, score_col_idx);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn matches_bm25_query(expr: &BoundExpr, spec: &Bm25PlanSpec) -> bool {
+    let Some((terms, index_name)) = extract_bm25_query_args(expr) else {
+        return false;
+    };
+    index_name == spec.index_name && terms == spec.terms
+}
+
+fn bm25_index_matches_table(table: &crate::catalog::TableInfo, spec: &Bm25PlanSpec) -> bool {
+    table.indexes.iter().any(|idx| {
+        idx.name == spec.index_name
+            && idx.column_indices == vec![spec.col_idx]
+            && matches!(idx.index_type, crate::catalog::IndexType::Bm25 { .. })
+    })
 }
 
 fn projection_schema_from_child(
@@ -448,11 +610,17 @@ fn infer_expr_type(
             "upper" | "lower" | "trim" | "concat" => crate::types::DataType::Text,
             "abs" => crate::types::DataType::Float64,
             "coalesce" => crate::types::DataType::Null,
+            "to_bm25query" => crate::types::DataType::Bm25Query,
             _ => crate::types::DataType::Null,
         },
         crate::query::expression::BoundExpr::WindowRowNumber { .. } => {
             crate::types::DataType::Int64
         }
-        crate::query::expression::BoundExpr::BinaryOp { .. } => crate::types::DataType::Null,
+        crate::query::expression::BoundExpr::BinaryOp { op, .. } => match op {
+            crate::query::expression::BinaryOp::L2Distance
+            | crate::query::expression::BinaryOp::CosineDistance
+            | crate::query::expression::BinaryOp::Bm25Score => crate::types::DataType::Float64,
+            _ => crate::types::DataType::Null,
+        },
     }
 }

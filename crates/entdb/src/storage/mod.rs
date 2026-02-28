@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+pub mod bm25;
 pub mod btree;
 pub mod buffer_pool;
 pub mod disk_manager;

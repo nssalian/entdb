@@ -70,6 +70,50 @@ is executed as:
 SELECT "id", "name" FROM "users" ORDER BY "id" LIMIT 2 OFFSET 1;
 ```
 
+## Vector and BM25 support (both modes)
+
+The same SQL surface is supported through:
+
+- server mode (`entdb-server`, pgwire clients such as `psql`)
+- embedded mode (`EntDb` Rust API)
+
+### Vector SQL
+
+- type: `VECTOR(n)`
+- literal form: `'[x,y,z]'`
+- operators:
+- `<->` (L2 distance)
+- `<=>` (cosine distance)
+
+Example:
+
+```sql
+CREATE TABLE embeddings (id INT, vec VECTOR(3));
+INSERT INTO embeddings VALUES (1, '[0.1,0.2,0.3]');
+SELECT id, vec <-> '[0.2,0.2,0.2]' AS dist FROM embeddings;
+```
+
+### BM25 SQL
+
+- index DDL: `CREATE INDEX ... USING bm25 (...) [WITH (...)]`
+- query constructor: `to_bm25query(query_text, index_name)`
+- scoring operator: `<@`
+
+Example:
+
+```sql
+CREATE TABLE docs (id INT, content TEXT);
+CREATE INDEX idx_docs_bm25 ON docs USING bm25 (content) WITH (text_config='english');
+SELECT id, content <@ to_bm25query('database', 'idx_docs_bm25') AS score
+FROM docs;
+```
+
+Status note:
+
+- BM25 sidecar index persistence and DML maintenance are implemented.
+- Planner/executor can use a BM25-backed scan for matching `<@ to_bm25query(...)` query shapes.
+- BM25 sidecar files are versioned (`version` field) with legacy unversioned read compatibility.
+
 ## Why this design
 
 - Same core engine for embedded and pgwire paths.

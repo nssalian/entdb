@@ -30,6 +30,8 @@ pub enum DataType {
     Text,
     Varchar(u32),
     Timestamp,
+    Vector(u32),
+    Bm25Query,
     Null,
 }
 
@@ -44,6 +46,11 @@ pub enum Value {
     Float64(f64),
     Text(String),
     Timestamp(i64),
+    Vector(Vec<f32>),
+    Bm25Query {
+        terms: Vec<String>,
+        index_name: String,
+    },
 }
 
 impl Value {
@@ -58,6 +65,8 @@ impl Value {
             Self::Float64(_) => DataType::Float64,
             Self::Text(_) => DataType::Text,
             Self::Timestamp(_) => DataType::Timestamp,
+            Self::Vector(v) => DataType::Vector(v.len() as u32),
+            Self::Bm25Query { .. } => DataType::Bm25Query,
         }
     }
 
@@ -100,6 +109,22 @@ impl Value {
             Self::Timestamp(v) => {
                 let mut out = vec![8];
                 out.extend_from_slice(&v.to_le_bytes());
+                out
+            }
+            Self::Vector(values) => {
+                let mut out = vec![9];
+                out.extend_from_slice(&(values.len() as u32).to_le_bytes());
+                for v in values {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                out
+            }
+            Self::Bm25Query { terms, index_name } => {
+                let mut out = vec![10];
+                let payload =
+                    serde_json::to_vec(&(terms, index_name)).expect("serialize bm25 query payload");
+                out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                out.extend_from_slice(&payload);
                 out
             }
         }
@@ -192,6 +217,57 @@ impl Value {
                 }
                 Ok(Self::Text(s.to_string()))
             }
+            DataType::Vector(dim) => {
+                let expected = (*dim as usize) * 4;
+                let payload = if data.len() == expected {
+                    data
+                } else if data.len() == expected + 4 {
+                    let declared =
+                        u32::from_le_bytes(data[0..4].try_into().expect("vector dim bytes"));
+                    if declared != *dim {
+                        return Err(EntDbError::InvalidPage(format!(
+                            "vector decode: expected dimension {dim}, got {declared}"
+                        )));
+                    }
+                    &data[4..]
+                } else {
+                    return Err(EntDbError::InvalidPage(format!(
+                        "vector decode: expected {expected} or {} bytes, got {}",
+                        expected + 4,
+                        data.len()
+                    )));
+                };
+                if payload.len() != expected {
+                    return Err(EntDbError::InvalidPage(format!(
+                        "vector decode: expected {expected} bytes, got {}",
+                        payload.len()
+                    )));
+                }
+                let mut out = Vec::with_capacity(*dim as usize);
+                for chunk in payload.chunks_exact(4) {
+                    out.push(f32::from_le_bytes(chunk.try_into().expect("f32 bytes")));
+                }
+                Ok(Self::Vector(out))
+            }
+            DataType::Bm25Query => {
+                let payload = if data.len() >= 4 {
+                    let declared =
+                        u32::from_le_bytes(data[0..4].try_into().expect("bm25 query len bytes"))
+                            as usize;
+                    if 4 + declared == data.len() {
+                        &data[4..]
+                    } else {
+                        data
+                    }
+                } else {
+                    data
+                };
+                let (terms, index_name): (Vec<String>, String) = serde_json::from_slice(payload)
+                    .map_err(|e| {
+                        EntDbError::InvalidPage(format!("bm25 query decode failed: {e}"))
+                    })?;
+                Ok(Self::Bm25Query { terms, index_name })
+            }
         }
     }
 
@@ -206,6 +282,10 @@ impl Value {
             Self::Float64(_) => 8,
             Self::Text(s) => s.len(),
             Self::Timestamp(_) => 8,
+            Self::Vector(values) => values.len() * 4,
+            Self::Bm25Query { terms, index_name } => {
+                terms.iter().map(|t| t.len()).sum::<usize>() + index_name.len()
+            }
         }
     }
 
@@ -223,6 +303,15 @@ impl Value {
             (Value::Float64(v), DataType::Float64) => Value::Float64(*v),
             (Value::Timestamp(v), DataType::Timestamp) => Value::Timestamp(*v),
             (Value::Text(v), DataType::Text | DataType::Varchar(_)) => Value::Text(v.clone()),
+            (Value::Vector(values), DataType::Vector(dim)) => {
+                if values.len() != *dim as usize {
+                    return Err(EntDbError::InvalidPage(format!(
+                        "vector dimension mismatch: expected {dim}, got {}",
+                        values.len()
+                    )));
+                }
+                Value::Vector(values.clone())
+            }
 
             (Value::Int16(v), DataType::Int32) => Value::Int32(*v as i32),
             (Value::Int16(v), DataType::Int64) => Value::Int64(*v as i64),
@@ -276,6 +365,26 @@ impl Value {
                 })?)
             }
             (Value::Text(v), DataType::Timestamp) => Value::Timestamp(parse_timestamp_text(v)?),
+            (Value::Text(v), DataType::Vector(dim)) => {
+                let parsed = parse_vector_text(v)?;
+                if parsed.len() != *dim as usize {
+                    return Err(EntDbError::InvalidPage(format!(
+                        "vector dimension mismatch: expected {dim}, got {}",
+                        parsed.len()
+                    )));
+                }
+                Value::Vector(parsed)
+            }
+            (Value::Vector(values), DataType::Text | DataType::Varchar(_)) => {
+                Value::Text(format_vector_text(values))
+            }
+            (Value::Bm25Query { terms, index_name }, DataType::Text | DataType::Varchar(_)) => {
+                Value::Text(format!(
+                    "bm25query(index={},terms={})",
+                    index_name,
+                    terms.join(" ")
+                ))
+            }
 
             (v, DataType::Text | DataType::Varchar(_)) => Value::Text(format!("{v:?}")),
 
@@ -342,6 +451,38 @@ fn parse_timestamp_text(v: &str) -> Result<i64> {
     Err(EntDbError::InvalidPage(
         "cast text->timestamp failed".to_string(),
     ))
+}
+
+pub fn parse_vector_text(v: &str) -> Result<Vec<f32>> {
+    let trimmed = v.trim();
+    if !(trimmed.starts_with('[') && trimmed.ends_with(']')) {
+        return Err(EntDbError::InvalidPage(
+            "cast text->vector failed".to_string(),
+        ));
+    }
+    let body = &trimmed[1..trimmed.len() - 1];
+    if body.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    for token in body.split(',') {
+        let value = token
+            .trim()
+            .parse::<f32>()
+            .map_err(|_| EntDbError::InvalidPage("cast text->vector failed".to_string()))?;
+        out.push(value);
+    }
+    Ok(out)
+}
+
+pub fn format_vector_text(values: &[f32]) -> String {
+    let inner = values
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{inner}]")
 }
 
 fn align_numeric(left: &Value, right: &Value) -> Result<(Value, Value)> {

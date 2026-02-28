@@ -59,8 +59,10 @@ impl Schema {
                 DataType::Float32 => 4,
                 DataType::Float64 => 8,
                 DataType::Timestamp => 8,
+                DataType::Vector(dim) => (dim as usize) * 4,
                 DataType::Varchar(n) => n as usize,
                 DataType::Text => 24,
+                DataType::Bm25Query => 24,
                 DataType::Null => 0,
             })
             .sum()

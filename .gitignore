@@ -28,6 +28,7 @@ fuzz/corpus/*
 *.txn.json
 *.catalog.json
 *.optimizer_history.json
+*.bm25.*.json
 
 # Docs output
 docs-site/book/

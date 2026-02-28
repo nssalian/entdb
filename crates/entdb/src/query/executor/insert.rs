@@ -16,6 +16,7 @@
 
 use crate::catalog::{Catalog, Schema, TableInfo};
 use crate::error::Result;
+use crate::query::executor::bm25_maintenance;
 use crate::query::executor::{encode_mvcc_row, Executor, MvccRow, TxExecutionContext};
 use crate::storage::table::Table;
 use crate::storage::tuple::Tuple;
@@ -76,7 +77,8 @@ impl Executor for InsertExecutor {
                 created_txn,
                 deleted_txn: None,
             })?;
-            table.insert(&Tuple::new(bytes))?;
+            let tid = table.insert(&Tuple::new(bytes))?;
+            bm25_maintenance::on_insert(&self.catalog, &self.table_info, row, tid)?;
             self.affected_rows = self.affected_rows.saturating_add(1);
         }
 

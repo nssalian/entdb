@@ -16,6 +16,7 @@
 
 use crate::catalog::{Catalog, Schema, TableInfo};
 use crate::error::{EntDbError, Result};
+use crate::query::executor::bm25_maintenance;
 use crate::query::executor::{
     decode_stored_row, encode_mvcc_row, row_visible, DecodedRow, Executor, MvccRow,
     TxExecutionContext,
@@ -85,11 +86,12 @@ impl Executor for UpsertExecutor {
             let existing = find_conflict_row(&table, input_row, &self.conflict_cols, tx_ref)?;
             match existing {
                 None => {
-                    table.insert(&Tuple::new(encode_mvcc_row(&MvccRow {
+                    let tid = table.insert(&Tuple::new(encode_mvcc_row(&MvccRow {
                         values: input_row.clone(),
                         created_txn: this_txn,
                         deleted_txn: None,
                     })?))?;
+                    bm25_maintenance::on_insert(&self.catalog, &self.table_info, input_row, tid)?;
                     self.affected_rows = self.affected_rows.saturating_add(1);
                 }
                 Some((tid, mut existing_version, expected_bytes)) => match &self.action {
@@ -100,6 +102,7 @@ impl Executor for UpsertExecutor {
                         excluded_offset,
                     } => {
                         apply_upsert_update(
+                            &self.catalog,
                             &table,
                             &self.table_info,
                             tid,
@@ -136,6 +139,7 @@ impl Executor for UpsertExecutor {
 }
 
 fn apply_upsert_update(
+    catalog: &Catalog,
     table: &Table,
     table_info: &TableInfo,
     tid: crate::storage::tuple::TupleId,
@@ -185,11 +189,22 @@ fn apply_upsert_update(
             table_info.name, tid
         )));
     }
-    table.insert(&Tuple::new(encode_mvcc_row(&MvccRow {
+    let inserted_tid = table.insert(&Tuple::new(encode_mvcc_row(&MvccRow {
         values: updated_row,
         created_txn: this_txn,
         deleted_txn: None,
     })?))?;
+    bm25_maintenance::on_delete(catalog, table_info, tid)?;
+    let latest = table.get(inserted_tid)?;
+    let latest_version = match decode_stored_row(&latest.data)? {
+        DecodedRow::Legacy(values) => MvccRow {
+            values,
+            created_txn: 0,
+            deleted_txn: None,
+        },
+        DecodedRow::Versioned(v) => v,
+    };
+    bm25_maintenance::on_insert(catalog, table_info, &latest_version.values, inserted_tid)?;
     Ok(())
 }
 
