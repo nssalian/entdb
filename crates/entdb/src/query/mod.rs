@@ -24,6 +24,7 @@ pub mod optimizer;
 pub mod plan;
 pub mod planner;
 pub mod polyglot;
+pub mod prepared_fast;
 
 #[cfg(test)]
 mod tests;
@@ -31,21 +32,27 @@ mod tests;
 use crate::catalog::Catalog;
 use crate::error::{EntDbError, Result};
 use crate::query::binder::Binder;
+use crate::query::executor::delete::DeleteExecutor;
+use crate::query::executor::insert::InsertExecutor;
+use crate::query::executor::update::UpdateExecutor;
 use crate::query::executor::{
     build_executor, decode_stored_row, row_visible, DecodedRow, ExecutionContext,
     TxExecutionContext,
 };
+use crate::query::expression::{BinaryOp, BoundExpr};
 use crate::query::history::{OptimizerHistoryRecord, OptimizerHistoryRecorder};
 use crate::query::optimizer::{Optimizer, OptimizerConfig, OptimizerTrace};
+use crate::query::plan::UpdateAssignment;
 use crate::query::planner::Planner;
 use crate::query::polyglot::{transpile_with_meta, PolyglotOptions};
 use crate::storage::table::Table;
-use crate::tx::{TransactionHandle, TransactionManager, TxnStatus};
+use crate::tx::{DurabilityMode, TransactionHandle, TransactionManager, TxnStatus};
 use crate::types::Value;
 use parking_lot::Mutex;
 use sqlparser::ast::{FromTable, Statement, TableObject};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -79,6 +86,24 @@ impl Default for VacuumPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExecuteOptions {
+    pub await_durable: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedStatement {
+    statements: Option<Arc<Vec<Statement>>>,
+    parse_error: Option<String>,
+    fast_path: Option<prepared_fast::PreparedFastPath>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BulkUpdate {
+    pub key: Value,
+    pub assignments: Vec<(String, Value)>,
+}
+
 pub struct QueryEngine {
     catalog: Arc<Catalog>,
     txn_manager: Arc<TransactionManager>,
@@ -91,14 +116,34 @@ pub struct QueryEngine {
     optimizer_config: Mutex<OptimizerConfig>,
     last_optimizer_trace: Mutex<Option<OptimizerTrace>>,
     optimizer_history: OptimizerHistoryRecorder,
+    read_plan_cache: Mutex<HashMap<String, CachedReadPlan>>,
+    read_plan_cache_epoch: AtomicU64,
+    read_plan_cache_max_entries: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CachedReadPlan {
+    epoch: u64,
+    fingerprint: String,
+    chosen_plan_signature: String,
+    trace: OptimizerTrace,
+    plan: crate::query::plan::LogicalPlan,
 }
 
 impl QueryEngine {
     pub fn new(catalog: Arc<Catalog>) -> Self {
-        Self::with_txn_persistence(catalog, true)
+        Self::with_txn_options(catalog, true, DurabilityMode::Full)
     }
 
     pub fn with_txn_persistence(catalog: Arc<Catalog>, durable: bool) -> Self {
+        Self::with_txn_options(catalog, durable, DurabilityMode::Full)
+    }
+
+    pub fn with_txn_options(
+        catalog: Arc<Catalog>,
+        durable: bool,
+        durability_mode: DurabilityMode,
+    ) -> Self {
         let txn_manager = if durable {
             let state_path = txn_state_path_for_catalog(&catalog);
             let wal_path = txn_wal_path_for_catalog(&catalog);
@@ -108,6 +153,7 @@ impl QueryEngine {
         } else {
             TransactionManager::new()
         };
+        txn_manager.set_durability_mode(durability_mode);
         let optimizer_history_path = optimizer_history_path_for_catalog(&catalog);
         Self {
             catalog,
@@ -139,116 +185,24 @@ impl QueryEngine {
                 )
                 .expect("fallback optimizer history recorder")
             }),
+            read_plan_cache: Mutex::new(HashMap::new()),
+            read_plan_cache_epoch: AtomicU64::new(0),
+            read_plan_cache_max_entries: 512,
         }
         .with_txn_id_floor_from_storage()
     }
 
     pub fn execute(&self, sql: &str) -> Result<Vec<QueryOutput>> {
-        let transpiled = transpile_with_meta(sql, *self.polyglot.lock())?;
-        let dialect = PostgreSqlDialect {};
-        let statements = Parser::parse_sql(&dialect, &transpiled.transpiled_sql).map_err(|e| {
-            if transpiled.changed {
-                EntDbError::Query(format!(
-                    "parse error: {e}; original_sql={:?}; transpiled_sql={:?}",
-                    transpiled.original_sql, transpiled.transpiled_sql
-                ))
-            } else {
-                EntDbError::Query(format!("parse error: {e}"))
-            }
-        })?;
+        self.execute_with_options(sql, ExecuteOptions::default())
+    }
 
-        let mut outputs = Vec::new();
-        for stmt in &statements {
-            match stmt {
-                Statement::StartTransaction { .. } => {
-                    let mut guard = self.current_txn.lock();
-                    if guard.is_some() {
-                        return Err(EntDbError::Query(
-                            "transaction already active for this session".to_string(),
-                        ));
-                    }
-                    *guard = Some(self.begin_txn());
-                    outputs.push(QueryOutput::AffectedRows(0));
-                }
-                Statement::Commit { .. } => {
-                    let tx = {
-                        let mut guard = self.current_txn.lock();
-                        guard.take().ok_or_else(|| {
-                            EntDbError::Query("no active transaction to COMMIT".to_string())
-                        })?
-                    };
-                    if let Err(e) = self.commit_txn(tx) {
-                        self.abort_txn(tx);
-                        return Err(e);
-                    }
-                    self.maybe_auto_vacuum()?;
-                    outputs.push(QueryOutput::AffectedRows(0));
-                }
-                Statement::Rollback { .. } => {
-                    let tx = {
-                        let mut guard = self.current_txn.lock();
-                        guard.take().ok_or_else(|| {
-                            EntDbError::Query("no active transaction to ROLLBACK".to_string())
-                        })?
-                    };
-                    self.abort_txn(tx);
-                    outputs.push(QueryOutput::AffectedRows(0));
-                }
-                _ => {
-                    let active_tx = *self.current_txn.lock();
-                    if let Some(tx) = active_tx {
-                        match self.execute_statement_in_txn(&tx, stmt) {
-                            Ok(out) => outputs.push(out),
-                            Err(e) => {
-                                self.record_optimizer_history(OptimizerHistoryRecord {
-                                    fingerprint: format!("stmt:{}", statement_kind(stmt)),
-                                    plan_signature: "error".to_string(),
-                                    schema_hash: optimizer_history_schema_hash().to_string(),
-                                    captured_at_ms: now_epoch_millis(),
-                                    rowcount_observed_json: "{\"root\":0}".to_string(),
-                                    latency_ms: 0,
-                                    memory_peak_bytes: 0,
-                                    success: false,
-                                    error_class: Some(error_class_for_error(&e)),
-                                    confidence: 0.0,
-                                });
-                                return Err(e);
-                            }
-                        }
-                    } else {
-                        let tx = self.begin_txn();
-                        match self.execute_statement_in_txn(&tx, stmt) {
-                            Ok(output) => {
-                                if let Err(e) = self.commit_txn(tx) {
-                                    self.abort_txn(tx);
-                                    return Err(e);
-                                }
-                                self.maybe_auto_vacuum()?;
-                                outputs.push(output);
-                            }
-                            Err(e) => {
-                                self.abort_txn(tx);
-                                self.record_optimizer_history(OptimizerHistoryRecord {
-                                    fingerprint: format!("stmt:{}", statement_kind(stmt)),
-                                    plan_signature: "error".to_string(),
-                                    schema_hash: optimizer_history_schema_hash().to_string(),
-                                    captured_at_ms: now_epoch_millis(),
-                                    rowcount_observed_json: "{\"root\":0}".to_string(),
-                                    latency_ms: 0,
-                                    memory_peak_bytes: 0,
-                                    success: false,
-                                    error_class: Some(error_class_for_error(&e)),
-                                    confidence: 0.0,
-                                });
-                                return Err(e);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(outputs)
+    pub fn execute_with_options(
+        &self,
+        sql: &str,
+        options: ExecuteOptions,
+    ) -> Result<Vec<QueryOutput>> {
+        let statements = self.parse_sql_statements(sql)?;
+        self.execute_statement_list_with_options(&statements, &[], options)
     }
 
     pub fn begin_txn(&self) -> TransactionHandle {
@@ -256,7 +210,16 @@ impl QueryEngine {
     }
 
     pub fn commit_txn(&self, tx: TransactionHandle) -> Result<()> {
-        self.txn_manager.commit(tx.txn_id)?;
+        self.commit_txn_with_options(tx, None)
+    }
+
+    pub fn commit_txn_with_options(
+        &self,
+        tx: TransactionHandle,
+        await_durable: Option<bool>,
+    ) -> Result<()> {
+        self.txn_manager
+            .commit_with_options(tx.txn_id, await_durable)?;
         Ok(())
     }
 
@@ -265,18 +228,7 @@ impl QueryEngine {
     }
 
     pub fn execute_in_txn(&self, tx: &TransactionHandle, sql: &str) -> Result<Vec<QueryOutput>> {
-        let transpiled = transpile_with_meta(sql, *self.polyglot.lock())?;
-        let dialect = PostgreSqlDialect {};
-        let statements = Parser::parse_sql(&dialect, &transpiled.transpiled_sql).map_err(|e| {
-            if transpiled.changed {
-                EntDbError::Query(format!(
-                    "parse error: {e}; original_sql={:?}; transpiled_sql={:?}",
-                    transpiled.original_sql, transpiled.transpiled_sql
-                ))
-            } else {
-                EntDbError::Query(format!("parse error: {e}"))
-            }
-        })?;
+        let statements = self.parse_sql_statements(sql)?;
 
         let mut out = Vec::new();
         for stmt in &statements {
@@ -289,7 +241,7 @@ impl QueryEngine {
                             .to_string(),
                     ));
                 }
-                _ => match self.execute_statement_in_txn(tx, stmt) {
+                _ => match self.execute_statement_in_txn_with_params(tx, stmt, &[]) {
                     Ok(o) => out.push(o),
                     Err(e) => {
                         self.record_optimizer_history(OptimizerHistoryRecord {
@@ -365,6 +317,11 @@ impl QueryEngine {
         self.catalog.buffer_pool().flush_all()
     }
 
+    pub fn flush_durable(&self) -> Result<()> {
+        self.flush_all()?;
+        self.txn_manager.flush_durable()
+    }
+
     pub fn set_vacuum_policy(&self, policy: VacuumPolicy) {
         *self.vacuum_policy.lock() = policy;
     }
@@ -378,26 +335,42 @@ impl QueryEngine {
 
     pub fn set_polyglot_enabled(&self, enabled: bool) {
         self.polyglot.lock().enabled = enabled;
+        self.invalidate_read_plan_cache();
     }
 
     pub fn set_optimizer_config(&self, config: OptimizerConfig) {
         *self.optimizer_config.lock() = config.sanitize();
+        self.invalidate_read_plan_cache();
     }
 
     pub fn disable_hbo(&self) {
         let mut cfg = self.optimizer_config();
         cfg.hbo_enabled = false;
         *self.optimizer_config.lock() = cfg;
+        self.invalidate_read_plan_cache();
     }
 
     pub fn force_baseline_planner(&self) {
         let mut cfg = self.optimizer_config();
         cfg.cbo_enabled = false;
         *self.optimizer_config.lock() = cfg;
+        self.invalidate_read_plan_cache();
     }
 
     pub fn optimizer_config(&self) -> OptimizerConfig {
         *self.optimizer_config.lock()
+    }
+
+    pub fn set_durability_mode(&self, mode: DurabilityMode) {
+        self.txn_manager.set_durability_mode(mode);
+    }
+
+    pub fn durability_mode(&self) -> DurabilityMode {
+        self.txn_manager.durability_mode()
+    }
+
+    pub fn set_checkpoint_interval(&self, interval: u64) {
+        self.txn_manager.set_checkpoint_interval(interval);
     }
 
     pub fn last_optimizer_trace(&self) -> Option<OptimizerTrace> {
@@ -419,6 +392,7 @@ impl QueryEngine {
     }
 
     pub fn clear_optimizer_history(&self) -> Result<()> {
+        self.invalidate_read_plan_cache();
         self.optimizer_history.clear()
     }
 
@@ -606,16 +580,38 @@ impl QueryEngine {
         }
     }
 
-    fn execute_statement_in_txn(
+    fn parse_sql_statements(&self, sql: &str) -> Result<Vec<Statement>> {
+        let transpiled = transpile_with_meta(sql, *self.polyglot.lock())?;
+        let dialect = PostgreSqlDialect {};
+        Parser::parse_sql(&dialect, &transpiled.transpiled_sql).map_err(|e| {
+            if transpiled.changed {
+                EntDbError::Query(format!(
+                    "parse error: {e}; original_sql={:?}; transpiled_sql={:?}",
+                    transpiled.original_sql, transpiled.transpiled_sql
+                ))
+            } else {
+                EntDbError::Query(format!("parse error: {e}"))
+            }
+        })
+    }
+
+    fn execute_statement_in_txn_with_params(
         &self,
         tx: &TransactionHandle,
         stmt: &Statement,
+        params: &[Value],
     ) -> Result<QueryOutput> {
+        if tx.txn_id == 0 && statement_is_read_only(stmt) {
+            if let Some(out) = self.execute_cached_read_statement_in_txn(tx, stmt)? {
+                return Ok(out);
+            }
+        }
+
         let binder = Binder::new(Arc::clone(&self.catalog));
         let planner = Planner;
 
         let started = Instant::now();
-        let bound = binder.bind(stmt)?;
+        let bound = binder.bind_with_params(stmt, params)?;
         let fingerprint = Optimizer::fingerprint_bound_statement(&bound);
         let history = self.optimizer_history_for_fingerprint(&fingerprint);
         let plan = planner.plan(bound)?;
@@ -633,6 +629,25 @@ impl QueryEngine {
             .unwrap_or_else(|| "baseline".to_string());
         *self.last_optimizer_trace.lock() = Some(optimized_outcome.trace.clone());
         let optimized = optimized_outcome.plan;
+        if tx.txn_id == 0 && statement_is_read_only(stmt) {
+            let cache_key = stmt.to_string();
+            let epoch = self.read_plan_cache_epoch.load(Ordering::Acquire);
+            let mut cache = self.read_plan_cache.lock();
+            if cache.len() >= self.read_plan_cache_max_entries {
+                cache.clear();
+            }
+            cache.insert(
+                cache_key,
+                CachedReadPlan {
+                    epoch,
+                    fingerprint: fingerprint.clone(),
+                    chosen_plan_signature: chosen_plan_signature.clone(),
+                    trace: optimized_outcome.trace.clone(),
+                    plan: optimized.clone(),
+                },
+            );
+        }
+
         let ctx = ExecutionContext {
             catalog: Arc::clone(&self.catalog),
             tx: Some(TxExecutionContext {
@@ -681,11 +696,79 @@ impl QueryEngine {
                 .fetch_add(affected_rows.unwrap_or(0), Ordering::SeqCst);
         }
         self.mark_stats_stale_for_statement(stmt, affected_rows.unwrap_or(1))?;
+        if !statement_is_read_only(stmt) {
+            self.invalidate_read_plan_cache();
+        }
 
         if rows.is_empty() && columns.is_empty() {
             Ok(QueryOutput::AffectedRows(affected_rows.unwrap_or(0)))
         } else {
             Ok(QueryOutput::Rows { columns, rows })
+        }
+    }
+
+    fn execute_cached_read_statement_in_txn(
+        &self,
+        tx: &TransactionHandle,
+        stmt: &Statement,
+    ) -> Result<Option<QueryOutput>> {
+        let cache_key = stmt.to_string();
+        let epoch = self.read_plan_cache_epoch.load(Ordering::Acquire);
+        let Some(entry) = self.read_plan_cache.lock().get(&cache_key).cloned() else {
+            return Ok(None);
+        };
+        if entry.epoch != epoch {
+            return Ok(None);
+        }
+
+        *self.last_optimizer_trace.lock() = Some(entry.trace.clone());
+        let started = Instant::now();
+        let ctx = ExecutionContext {
+            catalog: Arc::clone(&self.catalog),
+            tx: Some(TxExecutionContext {
+                txn_id: tx.txn_id,
+                snapshot_ts: tx.snapshot_ts,
+                txn_manager: Arc::clone(&self.txn_manager),
+            }),
+        };
+        let mut exec = build_executor(&entry.plan, &ctx)?;
+        exec.open()?;
+        let mut rows = Vec::new();
+        while let Some(row) = exec.next()? {
+            rows.push(row);
+        }
+        let columns: Vec<String> = exec
+            .schema()
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        let affected_rows = exec.affected_rows();
+        exec.close()?;
+
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let observed_rows = if !rows.is_empty() {
+            rows.len() as u64
+        } else {
+            affected_rows.unwrap_or(0)
+        };
+        self.record_optimizer_history(OptimizerHistoryRecord {
+            fingerprint: entry.fingerprint,
+            plan_signature: entry.chosen_plan_signature,
+            schema_hash: optimizer_history_schema_hash().to_string(),
+            captured_at_ms: now_epoch_millis(),
+            rowcount_observed_json: format!("{{\"root\":{observed_rows}}}"),
+            latency_ms,
+            memory_peak_bytes: 0,
+            success: true,
+            error_class: None,
+            confidence: 1.0,
+        });
+
+        if rows.is_empty() && columns.is_empty() {
+            Ok(Some(QueryOutput::AffectedRows(affected_rows.unwrap_or(0))))
+        } else {
+            Ok(Some(QueryOutput::Rows { columns, rows }))
         }
     }
 
@@ -756,6 +839,490 @@ impl QueryEngine {
     fn record_optimizer_history(&self, entry: OptimizerHistoryRecord) {
         self.optimizer_history.try_record(entry);
     }
+
+    fn invalidate_read_plan_cache(&self) {
+        self.read_plan_cache_epoch.fetch_add(1, Ordering::AcqRel);
+        self.read_plan_cache.lock().clear();
+    }
+
+    pub fn prepare(&self, sql_template: &str) -> PreparedStatement {
+        match self.parse_sql_statements(sql_template) {
+            Ok(statements) => PreparedStatement {
+                fast_path: prepared_fast::PreparedFastPath::compile(&self.catalog, &statements),
+                statements: Some(Arc::new(statements)),
+                parse_error: None,
+            },
+            Err(err) => PreparedStatement {
+                fast_path: None,
+                statements: None,
+                parse_error: Some(err.to_string()),
+            },
+        }
+    }
+
+    pub fn execute_prepared(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+    ) -> Result<Vec<QueryOutput>> {
+        self.execute_prepared_with_options(prepared, params, ExecuteOptions::default())
+    }
+
+    pub fn execute_prepared_with_options(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+        options: ExecuteOptions,
+    ) -> Result<Vec<QueryOutput>> {
+        if let Some(err) = prepared.parse_error.as_ref() {
+            return Err(EntDbError::Query(format!(
+                "prepared statement parse error: {err}"
+            )));
+        }
+        let statements = prepared.statements.as_ref().ok_or_else(|| {
+            EntDbError::Query("prepared statement has no parsed statements".to_string())
+        })?;
+
+        if let Some(fast_path) = prepared.fast_path.as_ref() {
+            return self
+                .execute_fast_prepared_with_options(fast_path, params, options)
+                .map(|output| vec![output]);
+        }
+
+        self.execute_statement_list_with_options(&statements, params, options)
+    }
+
+    fn execute_fast_prepared_with_options(
+        &self,
+        fast_path: &prepared_fast::PreparedFastPath,
+        params: &[Value],
+        options: ExecuteOptions,
+    ) -> Result<QueryOutput> {
+        let active_tx = *self.current_txn.lock();
+        if let Some(tx) = active_tx {
+            return self.execute_fast_prepared_in_txn(&tx, fast_path, params);
+        }
+
+        if fast_path.is_read_only() {
+            let snapshot_tx = TransactionHandle {
+                txn_id: 0,
+                snapshot_ts: self.txn_manager.latest_commit_ts(),
+            };
+            return self.execute_fast_prepared_in_txn(&snapshot_tx, fast_path, params);
+        }
+
+        let tx = self.begin_txn();
+        match self.execute_fast_prepared_in_txn(&tx, fast_path, params) {
+            Ok(output) => {
+                if let Err(err) = self.commit_txn_with_options(tx, options.await_durable) {
+                    self.abort_txn(tx);
+                    return Err(err);
+                }
+                self.maybe_auto_vacuum()?;
+                Ok(output)
+            }
+            Err(err) => {
+                self.abort_txn(tx);
+                Err(err)
+            }
+        }
+    }
+
+    fn execute_fast_prepared_in_txn(
+        &self,
+        tx: &TransactionHandle,
+        fast_path: &prepared_fast::PreparedFastPath,
+        params: &[Value],
+    ) -> Result<QueryOutput> {
+        let output = fast_path.execute(self, tx, params)?;
+        if fast_path.is_read_only() {
+            return Ok(output);
+        }
+
+        let affected_rows = match &output {
+            QueryOutput::AffectedRows(rows) => *rows,
+            QueryOutput::Rows { rows, .. } => rows.len() as u64,
+        };
+
+        if fast_path.creates_deleted_versions() {
+            self.deleted_versions_since_vacuum
+                .fetch_add(affected_rows, Ordering::SeqCst);
+        }
+        if let Some(table_name) = fast_path.mutated_table_name() {
+            self.catalog
+                .mark_table_stats_stale(table_name, affected_rows.max(1))?;
+        }
+        self.invalidate_read_plan_cache();
+        Ok(output)
+    }
+
+    pub fn insert_many(&self, table_name: &str, rows: &[Vec<Value>]) -> Result<u64> {
+        self.insert_many_with_options(table_name, rows, ExecuteOptions::default())
+    }
+
+    pub fn insert_many_with_options(
+        &self,
+        table_name: &str,
+        rows: &[Vec<Value>],
+        options: ExecuteOptions,
+    ) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let table = self.require_table(table_name)?;
+        let normalized_rows = rows
+            .iter()
+            .map(|row| normalize_row_values(&table, row))
+            .collect::<Result<Vec<_>>>()?;
+        let affected = self.run_write_in_txn(options, |engine, tx| {
+            let ctx = TxExecutionContext {
+                txn_id: tx.txn_id,
+                snapshot_ts: tx.snapshot_ts,
+                txn_manager: Arc::clone(&engine.txn_manager),
+            };
+            let mut exec = InsertExecutor::new(
+                table.clone(),
+                normalized_rows.clone(),
+                Arc::clone(&engine.catalog),
+                Some(ctx),
+            );
+            run_affected_rows_executor(&mut exec)
+        })?;
+        self.catalog
+            .mark_table_stats_stale(table_name, affected.max(1))?;
+        self.invalidate_read_plan_cache();
+        Ok(affected)
+    }
+
+    pub fn update_many(
+        &self,
+        table_name: &str,
+        key_column: &str,
+        updates: &[BulkUpdate],
+    ) -> Result<u64> {
+        self.update_many_with_options(table_name, key_column, updates, ExecuteOptions::default())
+    }
+
+    pub fn update_many_with_options(
+        &self,
+        table_name: &str,
+        key_column: &str,
+        updates: &[BulkUpdate],
+        options: ExecuteOptions,
+    ) -> Result<u64> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let table = self.require_table(table_name)?;
+        let key_col_idx = table.schema.column_index(key_column).ok_or_else(|| {
+            EntDbError::Query(format!(
+                "column '{key_column}' does not exist on table '{table_name}'"
+            ))
+        })?;
+        let key_type = table.schema.columns[key_col_idx].data_type.clone();
+        let compiled_updates = updates
+            .iter()
+            .map(|update| {
+                let key = update.key.cast_to(&key_type)?;
+                let assignments = update
+                    .assignments
+                    .iter()
+                    .map(|(column, value)| {
+                        let col_idx = table.schema.column_index(column).ok_or_else(|| {
+                            EntDbError::Query(format!(
+                                "column '{column}' does not exist on table '{table_name}'"
+                            ))
+                        })?;
+                        let casted = value.cast_to(&table.schema.columns[col_idx].data_type)?;
+                        Ok(UpdateAssignment {
+                            col_idx,
+                            expr: BoundExpr::Literal(casted),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((key, assignments))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let affected = self.run_write_in_txn(options, |engine, tx| {
+            let mut total = 0_u64;
+            for (key, assignments) in &compiled_updates {
+                let ctx = TxExecutionContext {
+                    txn_id: tx.txn_id,
+                    snapshot_ts: tx.snapshot_ts,
+                    txn_manager: Arc::clone(&engine.txn_manager),
+                };
+                let filter = BoundExpr::BinaryOp {
+                    op: BinaryOp::Eq,
+                    left: Box::new(BoundExpr::ColumnRef {
+                        col_idx: key_col_idx,
+                    }),
+                    right: Box::new(BoundExpr::Literal(key.clone())),
+                };
+                let mut exec = UpdateExecutor::new(
+                    table.clone(),
+                    assignments.clone(),
+                    Some(filter),
+                    Arc::clone(&engine.catalog),
+                    Some(ctx),
+                );
+                total = total.saturating_add(run_affected_rows_executor(&mut exec)?);
+            }
+            Ok(total)
+        })?;
+        self.deleted_versions_since_vacuum
+            .fetch_add(affected, Ordering::SeqCst);
+        self.catalog
+            .mark_table_stats_stale(table_name, affected.max(1))?;
+        self.invalidate_read_plan_cache();
+        Ok(affected)
+    }
+
+    pub fn delete_many(&self, table_name: &str, key_column: &str, keys: &[Value]) -> Result<u64> {
+        self.delete_many_with_options(table_name, key_column, keys, ExecuteOptions::default())
+    }
+
+    pub fn delete_many_with_options(
+        &self,
+        table_name: &str,
+        key_column: &str,
+        keys: &[Value],
+        options: ExecuteOptions,
+    ) -> Result<u64> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let table = self.require_table(table_name)?;
+        let key_col_idx = table.schema.column_index(key_column).ok_or_else(|| {
+            EntDbError::Query(format!(
+                "column '{key_column}' does not exist on table '{table_name}'"
+            ))
+        })?;
+        let key_type = table.schema.columns[key_col_idx].data_type.clone();
+        let normalized_keys = keys
+            .iter()
+            .map(|key| key.cast_to(&key_type))
+            .collect::<Result<Vec<_>>>()?;
+
+        let affected = self.run_write_in_txn(options, |engine, tx| {
+            let mut total = 0_u64;
+            for key in &normalized_keys {
+                let ctx = TxExecutionContext {
+                    txn_id: tx.txn_id,
+                    snapshot_ts: tx.snapshot_ts,
+                    txn_manager: Arc::clone(&engine.txn_manager),
+                };
+                let filter = BoundExpr::BinaryOp {
+                    op: BinaryOp::Eq,
+                    left: Box::new(BoundExpr::ColumnRef {
+                        col_idx: key_col_idx,
+                    }),
+                    right: Box::new(BoundExpr::Literal(key.clone())),
+                };
+                let mut exec = DeleteExecutor::new(
+                    table.clone(),
+                    Some(filter),
+                    Arc::clone(&engine.catalog),
+                    Some(ctx),
+                );
+                total = total.saturating_add(run_affected_rows_executor(&mut exec)?);
+            }
+            Ok(total)
+        })?;
+        self.deleted_versions_since_vacuum
+            .fetch_add(affected, Ordering::SeqCst);
+        self.catalog
+            .mark_table_stats_stale(table_name, affected.max(1))?;
+        self.invalidate_read_plan_cache();
+        Ok(affected)
+    }
+
+    fn require_table(&self, table_name: &str) -> Result<crate::catalog::TableInfo> {
+        self.catalog
+            .get_table(table_name)
+            .ok_or_else(|| EntDbError::Query(format!("table '{table_name}' does not exist")))
+    }
+
+    fn run_write_in_txn<F>(&self, options: ExecuteOptions, f: F) -> Result<u64>
+    where
+        F: FnOnce(&Self, &TransactionHandle) -> Result<u64>,
+    {
+        let active_tx = *self.current_txn.lock();
+        if let Some(tx) = active_tx {
+            return f(self, &tx);
+        }
+
+        let tx = self.begin_txn();
+        match f(self, &tx) {
+            Ok(affected) => {
+                if let Err(err) = self.commit_txn_with_options(tx, options.await_durable) {
+                    self.abort_txn(tx);
+                    return Err(err);
+                }
+                self.maybe_auto_vacuum()?;
+                Ok(affected)
+            }
+            Err(err) => {
+                self.abort_txn(tx);
+                Err(err)
+            }
+        }
+    }
+
+    fn execute_statement_list_with_options(
+        &self,
+        statements: &[Statement],
+        params: &[Value],
+        options: ExecuteOptions,
+    ) -> Result<Vec<QueryOutput>> {
+        let mut outputs = Vec::new();
+        for stmt in statements {
+            match stmt {
+                Statement::StartTransaction { .. } => {
+                    let mut guard = self.current_txn.lock();
+                    if guard.is_some() {
+                        return Err(EntDbError::Query(
+                            "transaction already active for this session".to_string(),
+                        ));
+                    }
+                    *guard = Some(self.begin_txn());
+                    outputs.push(QueryOutput::AffectedRows(0));
+                }
+                Statement::Commit { .. } => {
+                    let tx = {
+                        let mut guard = self.current_txn.lock();
+                        guard.take().ok_or_else(|| {
+                            EntDbError::Query("no active transaction to COMMIT".to_string())
+                        })?
+                    };
+                    if let Err(e) = self.commit_txn_with_options(tx, options.await_durable) {
+                        self.abort_txn(tx);
+                        return Err(e);
+                    }
+                    self.maybe_auto_vacuum()?;
+                    outputs.push(QueryOutput::AffectedRows(0));
+                }
+                Statement::Rollback { .. } => {
+                    let tx = {
+                        let mut guard = self.current_txn.lock();
+                        guard.take().ok_or_else(|| {
+                            EntDbError::Query("no active transaction to ROLLBACK".to_string())
+                        })?
+                    };
+                    self.abort_txn(tx);
+                    outputs.push(QueryOutput::AffectedRows(0));
+                }
+                _ => {
+                    let active_tx = *self.current_txn.lock();
+                    if let Some(tx) = active_tx {
+                        match self.execute_statement_in_txn_with_params(&tx, stmt, params) {
+                            Ok(out) => outputs.push(out),
+                            Err(e) => {
+                                self.record_optimizer_history(OptimizerHistoryRecord {
+                                    fingerprint: format!("stmt:{}", statement_kind(stmt)),
+                                    plan_signature: "error".to_string(),
+                                    schema_hash: optimizer_history_schema_hash().to_string(),
+                                    captured_at_ms: now_epoch_millis(),
+                                    rowcount_observed_json: "{\"root\":0}".to_string(),
+                                    latency_ms: 0,
+                                    memory_peak_bytes: 0,
+                                    success: false,
+                                    error_class: Some(error_class_for_error(&e)),
+                                    confidence: 0.0,
+                                });
+                                return Err(e);
+                            }
+                        }
+                    } else {
+                        if statement_is_read_only(stmt) {
+                            let snapshot_tx = TransactionHandle {
+                                txn_id: 0,
+                                snapshot_ts: self.txn_manager.latest_commit_ts(),
+                            };
+                            match self.execute_statement_in_txn_with_params(
+                                &snapshot_tx,
+                                stmt,
+                                params,
+                            ) {
+                                Ok(output) => outputs.push(output),
+                                Err(e) => {
+                                    self.record_optimizer_history(OptimizerHistoryRecord {
+                                        fingerprint: format!("stmt:{}", statement_kind(stmt)),
+                                        plan_signature: "error".to_string(),
+                                        schema_hash: optimizer_history_schema_hash().to_string(),
+                                        captured_at_ms: now_epoch_millis(),
+                                        rowcount_observed_json: "{\"root\":0}".to_string(),
+                                        latency_ms: 0,
+                                        memory_peak_bytes: 0,
+                                        success: false,
+                                        error_class: Some(error_class_for_error(&e)),
+                                        confidence: 0.0,
+                                    });
+                                    return Err(e);
+                                }
+                            }
+                        } else {
+                            let tx = self.begin_txn();
+                            match self.execute_statement_in_txn_with_params(&tx, stmt, params) {
+                                Ok(output) => {
+                                    if let Err(e) =
+                                        self.commit_txn_with_options(tx, options.await_durable)
+                                    {
+                                        self.abort_txn(tx);
+                                        return Err(e);
+                                    }
+                                    self.maybe_auto_vacuum()?;
+                                    outputs.push(output);
+                                }
+                                Err(e) => {
+                                    self.abort_txn(tx);
+                                    self.record_optimizer_history(OptimizerHistoryRecord {
+                                        fingerprint: format!("stmt:{}", statement_kind(stmt)),
+                                        plan_signature: "error".to_string(),
+                                        schema_hash: optimizer_history_schema_hash().to_string(),
+                                        captured_at_ms: now_epoch_millis(),
+                                        rowcount_observed_json: "{\"root\":0}".to_string(),
+                                        latency_ms: 0,
+                                        memory_peak_bytes: 0,
+                                        success: false,
+                                        error_class: Some(error_class_for_error(&e)),
+                                        confidence: 0.0,
+                                    });
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(outputs)
+    }
+}
+
+fn normalize_row_values(table: &crate::catalog::TableInfo, row: &[Value]) -> Result<Vec<Value>> {
+    if row.len() != table.schema.columns.len() {
+        return Err(EntDbError::Query(format!(
+            "row for table '{}' has {} values but schema expects {}",
+            table.name,
+            row.len(),
+            table.schema.columns.len()
+        )));
+    }
+
+    row.iter()
+        .zip(&table.schema.columns)
+        .map(|(value, column)| value.cast_to(&column.data_type))
+        .collect()
+}
+
+fn run_affected_rows_executor(exec: &mut dyn executor::Executor) -> Result<u64> {
+    exec.open()?;
+    while exec.next()?.is_some() {}
+    let affected = exec.affected_rows().unwrap_or(0);
+    exec.close()?;
+    Ok(affected)
 }
 
 fn txn_state_path_for_catalog(catalog: &Catalog) -> PathBuf {
@@ -849,6 +1416,10 @@ fn statement_kind(stmt: &Statement) -> &'static str {
         Statement::Rollback { .. } => "rollback",
         _ => "other",
     }
+}
+
+fn statement_is_read_only(stmt: &Statement) -> bool {
+    matches!(stmt, Statement::Query(_))
 }
 
 fn error_class_for_error(err: &EntDbError) -> String {

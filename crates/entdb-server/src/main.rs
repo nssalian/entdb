@@ -15,6 +15,7 @@
  */
 
 use clap::Parser;
+use entdb::DurabilityMode;
 use entdb_server::cli::Cli;
 use entdb_server::server::auth::AuthMethod;
 use entdb_server::server::{run, ServerConfig};
@@ -66,6 +67,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
     };
+    let durability_mode = match cli.durability_mode.to_ascii_lowercase().as_str() {
+        "full" => DurabilityMode::Full,
+        "normal" => DurabilityMode::Normal,
+        "off" => DurabilityMode::Off,
+        other => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "unsupported --durability-mode '{other}', expected 'full', 'normal', or 'off'"
+                ),
+            )
+            .into());
+        }
+    };
     let auth_password = resolve_auth_password(&cli)?;
 
     let config = ServerConfig {
@@ -82,6 +97,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth_password,
         tls_cert: cli.tls_cert.map(Into::into),
         tls_key: cli.tls_key.map(Into::into),
+        durability_mode,
+        await_durable: cli.await_durable,
     };
 
     run(config).await?;

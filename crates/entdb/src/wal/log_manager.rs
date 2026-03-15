@@ -81,6 +81,14 @@ impl LogManager {
     }
 
     pub fn flush(&self) -> Result<()> {
+        self.flush_inner(true)
+    }
+
+    pub fn flush_no_sync(&self) -> Result<()> {
+        self.flush_inner(false)
+    }
+
+    fn flush_inner(&self, sync: bool) -> Result<()> {
         if fault::should_fail("wal.flush") {
             return Err(EntDbError::Wal("failpoint: wal.flush".to_string()));
         }
@@ -100,7 +108,9 @@ impl LogManager {
         if fault::should_fail("wal.sync") {
             return Err(EntDbError::Wal("failpoint: wal.sync".to_string()));
         }
-        file.sync_all()?;
+        if sync {
+            file.sync_data()?;
+        }
 
         buf.clear();
         self.flushed_lsn.store(last_lsn, Ordering::Release);

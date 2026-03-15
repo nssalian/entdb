@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use entdb::tx::DurabilityMode;
 use entdb_server::server::{serve, Database, ServerConfig};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use std::sync::Arc;
@@ -26,7 +27,7 @@ use tokio_postgres::NoTls;
 async fn malformed_startup_packets_do_not_take_down_server() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_path = dir.path().join("ingress.db");
-    let db = Arc::new(Database::open(&data_path, 128).expect("open db"));
+    let db = Arc::new(Database::open(&data_path, 128, DurabilityMode::Full).expect("open db"));
     let cfg = Arc::new(ServerConfig {
         data_path,
         host: "127.0.0.1".to_string(),
@@ -41,6 +42,8 @@ async fn malformed_startup_packets_do_not_take_down_server() {
         auth_password: "entdb".to_string(),
         tls_cert: None,
         tls_key: None,
+        durability_mode: DurabilityMode::Full,
+        await_durable: false,
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");

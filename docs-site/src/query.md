@@ -33,6 +33,44 @@ It also supports:
 - typed parameter binding for extended protocol (AST-level binding, no string substitution),
 - optional SQL dialect transpilation ingress with guarded fallback/error contracts.
 
+## Prepared execution
+
+EntDB has two prepared execution layers:
+
+- generic prepared execution, which reuses parsed SQL and bound parameters
+- a narrow prepared fast path for common hot statements
+
+The current fast path covers:
+
+- `SELECT ... FROM t`
+- `SELECT ... FROM t WHERE col = $1`
+- `SELECT COUNT(*) ... WHERE col OP $1`
+- simple single-row `INSERT`
+- keyed `UPDATE`
+- keyed `DELETE`
+
+This fast path is intentionally narrow. Unsupported shapes fall back to the normal binder/planner/executor pipeline.
+
+## Index-backed equality lookups
+
+For single-column B-tree indexes, equality predicates can bypass full scans:
+
+- `CREATE INDEX ... USING btree` builds the index over existing rows
+- later DML keeps the index in sync
+- simple equality filters can dispatch to an index lookup executor
+
+This is the path used to speed up repeated keyed lookups such as `WHERE id = $1`.
+
+## Bulk embedded APIs
+
+The embedded Rust API also exposes batched write helpers:
+
+- `insert_many(...)`
+- `update_many(...)`
+- `delete_many(...)`
+
+These helpers are not new SQL syntax. They are embedded API shortcuts that execute repeated keyed changes in one transaction while avoiding repeated SQL parse/bind/plan work.
+
 ## SQL Dialect Transpiler Support
 
 EntDB includes a guarded SQL transpiler ingress for selected non-PostgreSQL query shapes.

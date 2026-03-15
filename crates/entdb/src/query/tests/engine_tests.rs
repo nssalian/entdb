@@ -15,7 +15,7 @@
  */
 
 use crate::catalog::{Catalog, IndexType};
-use crate::query::{QueryEngine, QueryOutput};
+use crate::query::{BulkUpdate, QueryEngine, QueryOutput};
 use crate::storage::bm25::Bm25Index;
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::disk_manager::DiskManager;
@@ -263,6 +263,76 @@ fn update_and_delete_affect_rows_and_data() {
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[0], vec![Value::Int32(2), Value::Int32(25)]);
             assert_eq!(rows[1], vec![Value::Int32(3), Value::Int32(30)]);
+        }
+        _ => panic!("expected rows"),
+    }
+}
+
+#[test]
+fn prepared_point_lookup_and_bulk_apis_work() {
+    let engine = setup_engine();
+    engine
+        .execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, value FLOAT)")
+        .expect("create table");
+    engine
+        .execute("CREATE INDEX idx_t_id ON t (id)")
+        .expect("create index");
+
+    let inserted = engine
+        .insert_many(
+            "t",
+            &[
+                vec![
+                    Value::Int64(1),
+                    Value::Text("alice".to_string()),
+                    Value::Float64(1.0),
+                ],
+                vec![
+                    Value::Int64(2),
+                    Value::Text("bob".to_string()),
+                    Value::Float64(2.0),
+                ],
+            ],
+        )
+        .expect("bulk insert");
+    assert_eq!(inserted, 2);
+
+    let prepared = engine.prepare("SELECT id, name, value FROM t WHERE id = $1");
+    let lookup = engine
+        .execute_prepared(&prepared, &[Value::Int64(2)])
+        .expect("prepared lookup");
+    match &lookup[0] {
+        QueryOutput::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Int32(2));
+            assert_eq!(rows[0][1], Value::Text("bob".to_string()));
+        }
+        _ => panic!("expected rows"),
+    }
+
+    let updated = engine
+        .update_many(
+            "t",
+            "id",
+            &[BulkUpdate {
+                key: Value::Int64(2),
+                assignments: vec![("value".to_string(), Value::Float64(7.0))],
+            }],
+        )
+        .expect("bulk update");
+    assert_eq!(updated, 1);
+
+    let deleted = engine
+        .delete_many("t", "id", &[Value::Int64(1)])
+        .expect("bulk delete");
+    assert_eq!(deleted, 1);
+
+    let out = engine
+        .execute("SELECT id, value FROM t ORDER BY id")
+        .expect("verify rows");
+    match &out[0] {
+        QueryOutput::Rows { rows, .. } => {
+            assert_eq!(rows, &vec![vec![Value::Int32(2), Value::Float64(7.0)]]);
         }
         _ => panic!("expected rows"),
     }
@@ -722,6 +792,87 @@ fn create_and_drop_index_sql_path() {
         .execute("DROP INDEX IF EXISTS idx_users_id")
         .expect("drop index if exists");
     assert_eq!(out, vec![QueryOutput::AffectedRows(0)]);
+}
+
+#[test]
+fn btree_index_builds_existing_rows_and_tracks_new_inserts() {
+    let engine = setup_engine();
+    engine
+        .execute("CREATE TABLE users (id INT PRIMARY KEY, email TEXT)")
+        .expect("create table");
+    engine
+        .execute("INSERT INTO users VALUES (1, 'a@x'), (2, 'b@x'), (3, 'c@x')")
+        .expect("insert rows");
+    engine
+        .execute("CREATE INDEX idx_users_id ON users (id)")
+        .expect("create index");
+
+    let existing = engine
+        .execute("SELECT email FROM users WHERE id = 2")
+        .expect("select existing row");
+    match &existing[0] {
+        QueryOutput::Rows { rows, .. } => {
+            assert_eq!(rows, &vec![vec![Value::Text("b@x".to_string())]]);
+        }
+        _ => panic!("expected rows"),
+    }
+
+    engine
+        .execute("INSERT INTO users VALUES (4, 'd@x')")
+        .expect("insert after index");
+    let inserted = engine
+        .execute("SELECT email FROM users WHERE id = 4")
+        .expect("select inserted row");
+    match &inserted[0] {
+        QueryOutput::Rows { rows, .. } => {
+            assert_eq!(rows, &vec![vec![Value::Text("d@x".to_string())]]);
+        }
+        _ => panic!("expected rows"),
+    }
+}
+
+#[test]
+fn btree_index_keeps_update_and_delete_by_key_correct() {
+    let engine = setup_engine();
+    engine
+        .execute("CREATE TABLE users (id INT PRIMARY KEY, email TEXT)")
+        .expect("create table");
+    engine
+        .execute("CREATE INDEX idx_users_id ON users (id)")
+        .expect("create index");
+    engine
+        .execute("INSERT INTO users VALUES (1, 'a@x'), (2, 'b@x'), (3, 'c@x')")
+        .expect("insert rows");
+
+    let updated = engine
+        .execute("UPDATE users SET email = 'b2@x' WHERE id = 2")
+        .expect("update indexed row");
+    assert_eq!(updated, vec![QueryOutput::AffectedRows(1)]);
+
+    let selected = engine
+        .execute("SELECT email FROM users WHERE id = 2")
+        .expect("select updated row");
+    match &selected[0] {
+        QueryOutput::Rows { rows, .. } => {
+            assert_eq!(rows, &vec![vec![Value::Text("b2@x".to_string())]]);
+        }
+        _ => panic!("expected rows"),
+    }
+
+    let deleted = engine
+        .execute("DELETE FROM users WHERE id = 2")
+        .expect("delete indexed row");
+    assert_eq!(deleted, vec![QueryOutput::AffectedRows(1)]);
+
+    let after_delete = engine
+        .execute("SELECT email FROM users WHERE id = 2")
+        .expect("select deleted row");
+    match &after_delete[0] {
+        QueryOutput::Rows { rows, .. } => {
+            assert!(rows.is_empty());
+        }
+        _ => panic!("expected rows"),
+    }
 }
 
 #[test]

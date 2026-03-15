@@ -21,6 +21,7 @@ use entdb::query::optimizer::{Optimizer, OptimizerConfig};
 use entdb::query::planner::Planner;
 use entdb::storage::buffer_pool::BufferPool;
 use entdb::storage::disk_manager::DiskManager;
+use entdb::DurabilityMode;
 use entdb_server::server::{serve, Database, ServerConfig};
 use rcgen::generate_simple_self_signed;
 use rustls_pemfile::{certs, pkcs8_private_keys};
@@ -61,6 +62,8 @@ impl TestServer {
             auth_password: "entdb".to_string(),
             tls_cert: None,
             tls_key: None,
+            durability_mode: DurabilityMode::Full,
+            await_durable: false,
         };
         Self::start_with_config(cfg).await
     }
@@ -101,7 +104,7 @@ impl TestServer {
         dir: Option<TempDir>,
     ) -> Self {
         cfg.data_path = data_path.to_path_buf();
-        let db = Arc::new(Database::open(data_path, 128).expect("open db"));
+        let db = Arc::new(Database::open(data_path, 128, DurabilityMode::Full).expect("open db"));
         let config = Arc::new(cfg);
         let tls_acceptor = if let Some(acceptor) = tls_acceptor {
             Some(acceptor)
@@ -237,6 +240,8 @@ fn base_config(data_path: PathBuf) -> ServerConfig {
         auth_password: "entdb".to_string(),
         tls_cert: None,
         tls_key: None,
+        durability_mode: DurabilityMode::Full,
+        await_durable: false,
     }
 }
 
@@ -656,6 +661,8 @@ async fn pgwire_scram_auth_connects_and_queries() {
         auth_password: "entdb".to_string(),
         tls_cert: None,
         tls_key: None,
+        durability_mode: DurabilityMode::Full,
+        await_durable: false,
     })
     .await;
 
@@ -748,6 +755,8 @@ async fn pgwire_connection_limit_refuses_excess_clients() {
         auth_password: "entdb".to_string(),
         tls_cert: None,
         tls_key: None,
+        durability_mode: DurabilityMode::Full,
+        await_durable: false,
     })
     .await;
 
@@ -837,6 +846,8 @@ async fn pgwire_tls_handshake_and_query_works() {
         auth_password: "entdb".to_string(),
         tls_cert: None,
         tls_key: None,
+        durability_mode: DurabilityMode::Full,
+        await_durable: false,
     };
     let (server, cert_path) = TestServer::start_with_tls_config(cfg).await;
     let dsn = format!(
@@ -891,6 +902,8 @@ async fn pgwire_tls_certificate_rotation_via_restart_works() {
         auth_password: "entdb".to_string(),
         tls_cert: Some(cert_path.clone()),
         tls_key: Some(key_path.clone()),
+        durability_mode: DurabilityMode::Full,
+        await_durable: false,
     };
 
     let server1 = TestServer::start_with_existing_path(&data_path, cfg.clone()).await;
@@ -953,6 +966,8 @@ async fn graceful_shutdown_persists_state_across_restart() {
         auth_password: "entdb".to_string(),
         tls_cert: None,
         tls_key: None,
+        durability_mode: DurabilityMode::Full,
+        await_durable: false,
     };
 
     let server1 = TestServer::start_with_existing_path(&data_path, cfg.clone()).await;
@@ -1010,6 +1025,8 @@ async fn crash_restart_inflight_txn_does_not_leak_uncommitted_rows() {
         auth_password: "entdb".to_string(),
         tls_cert: None,
         tls_key: None,
+        durability_mode: DurabilityMode::Full,
+        await_durable: false,
     };
 
     let server0 = TestServer::start_with_existing_path(&data_path, cfg.clone()).await;
@@ -1090,6 +1107,8 @@ async fn crash_restart_after_rollback_keeps_last_committed_value() {
         auth_password: "entdb".to_string(),
         tls_cert: None,
         tls_key: None,
+        durability_mode: DurabilityMode::Full,
+        await_durable: false,
     };
 
     let server0 = TestServer::start_with_existing_path(&data_path, cfg.clone()).await;
@@ -1171,6 +1190,8 @@ async fn query_timeout_enforced_for_heavy_sort_statement() {
         auth_password: "entdb".to_string(),
         tls_cert: None,
         tls_key: None,
+        durability_mode: DurabilityMode::Full,
+        await_durable: false,
     };
     let server_setup = TestServer::start_with_existing_path(&data_path, setup_cfg.clone()).await;
     let dsn_setup = format!(

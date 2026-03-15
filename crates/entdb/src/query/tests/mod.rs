@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+mod durability_tests;
 mod engine_tests;
 mod hardening_tests;
 mod mvcc_tests;

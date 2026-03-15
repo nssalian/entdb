@@ -5,6 +5,8 @@ edition = "2021"
 description = "Rust-based SQL database engine core for EntDB."
 license = "Apache-2.0"
 repository = "https://github.com/nssalian/entdb"
+homepage = "https://github.com/nssalian/entdb"
+documentation = "https://docs.rs/entdb"
 readme = "README.md"
 keywords = ["database", "sql", "storage", "mvcc", "wal"]
 categories = ["database-implementations"]
@@ -33,4 +35,8 @@ harness = false
 
 [[bench]]
 name = "comparative_bench"
+harness = false
+
+[[bench]]
+name = "workload_bench"
 harness = false

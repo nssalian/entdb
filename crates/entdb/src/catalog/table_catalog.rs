@@ -16,6 +16,7 @@
 
 use crate::catalog::schema::Schema;
 use crate::error::{EntDbError, Result};
+use crate::storage::btree::{BTree, KeySchema};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::page::PageId;
 use crate::types::Value;
@@ -302,9 +303,14 @@ impl Catalog {
             out
         };
 
-        let root_page_id = {
-            let page = self.buffer_pool.new_page()?;
-            page.page_id()
+        let root_page_id = match index_type {
+            IndexType::BTree => {
+                BTree::create(Arc::clone(&self.buffer_pool), KeySchema)?.root_page_id()
+            }
+            IndexType::Bm25 { .. } => {
+                let page = self.buffer_pool.new_page()?;
+                page.page_id()
+            }
         };
 
         let idx = IndexInfo {

@@ -18,6 +18,7 @@ pub mod alter_table;
 pub mod analyze;
 pub mod bm25_maintenance;
 pub mod bm25_scan;
+pub mod btree_maintenance;
 pub mod count;
 pub mod create_index;
 pub mod create_table;
@@ -28,6 +29,7 @@ pub mod drop_table;
 pub mod filter;
 pub mod group_aggregate;
 pub mod group_count;
+pub mod index_lookup;
 pub mod insert;
 pub mod insert_from_select;
 pub mod limit;
@@ -45,6 +47,7 @@ pub mod values;
 
 use crate::catalog::{Catalog, Schema};
 use crate::error::{EntDbError, Result};
+use crate::query::expression::{BinaryOp, BoundExpr};
 use crate::query::plan::LogicalPlan;
 use crate::tx::{TransactionManager, TxnId, TxnStatus};
 use crate::types::Value;
@@ -118,6 +121,28 @@ pub fn build_executor(plan: &LogicalPlan, ctx: &ExecutionContext) -> Result<Box<
             )))
         }
         LogicalPlan::Filter { predicate, child } => {
+            if let LogicalPlan::SeqScan { table } = child.as_ref() {
+                if let Some((col_idx, value, stop_after_first_match)) =
+                    eq_filter_hint(table, predicate)
+                {
+                    if btree_maintenance::has_btree_index_on_column(table, col_idx) {
+                        return Ok(Box::new(index_lookup::IndexLookupExecutor::new(
+                            table.clone(),
+                            Arc::clone(&ctx.catalog),
+                            ctx.tx.clone(),
+                            col_idx,
+                            value,
+                        )));
+                    }
+                    return Ok(Box::new(seq_scan::SeqScanExecutor::new_with_eq_filter(
+                        table.clone(),
+                        Arc::clone(&ctx.catalog),
+                        ctx.tx.clone(),
+                        Some((col_idx, value)),
+                        stop_after_first_match,
+                    )));
+                }
+            }
             let child_exec = build_executor(child, ctx)?;
             Ok(Box::new(filter::FilterExecutor::new(
                 predicate.clone(),
@@ -329,6 +354,7 @@ pub fn build_executor(plan: &LogicalPlan, ctx: &ExecutionContext) -> Result<Box<
             *if_not_exists,
             index_type.clone(),
             Arc::clone(&ctx.catalog),
+            ctx.tx.clone(),
         ))),
         LogicalPlan::DropIndex {
             index_name,
@@ -347,6 +373,31 @@ pub fn build_executor(plan: &LogicalPlan, ctx: &ExecutionContext) -> Result<Box<
             Arc::clone(&ctx.catalog),
         ))),
     }
+}
+
+fn eq_filter_hint(
+    table: &crate::catalog::TableInfo,
+    predicate: &BoundExpr,
+) -> Option<(usize, Value, bool)> {
+    let (col_idx, value) = match predicate {
+        BoundExpr::BinaryOp {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => match (left.as_ref(), right.as_ref()) {
+            (BoundExpr::ColumnRef { col_idx }, BoundExpr::Literal(v)) => (*col_idx, v.clone()),
+            (BoundExpr::Literal(v), BoundExpr::ColumnRef { col_idx }) => (*col_idx, v.clone()),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let stop_after_first_match = table
+        .schema
+        .columns
+        .get(col_idx)
+        .map(|c| c.primary_key)
+        .unwrap_or(false);
+    Some((col_idx, value, stop_after_first_match))
 }
 
 pub fn encode_row(row: &[Value]) -> Result<Vec<u8>> {

@@ -16,7 +16,7 @@
 
 use crate::catalog::{Catalog, Schema, TableInfo};
 use crate::error::{EntDbError, Result};
-use crate::query::executor::bm25_maintenance;
+use crate::query::executor::{bm25_maintenance, btree_maintenance};
 use crate::query::executor::{
     decode_stored_row, encode_mvcc_row, row_visible, DecodedRow, Executor, MvccRow,
     TxExecutionContext,
@@ -75,39 +75,65 @@ impl Executor for DeleteExecutor {
         let this_txn = self.tx.as_ref().map(|t| t.txn_id).unwrap_or(0);
         let tx_ref = self.tx.as_ref();
         let mut targets = Vec::new();
+        let pk_eq_hint = primary_key_eq_filter_hint(&self.table_info, self.filter.as_ref());
 
-        for (tid, tuple) in table.scan() {
-            let stored = decode_stored_row(&tuple.data)?;
-            let (row, version) = match stored {
-                DecodedRow::Legacy(row) => (
-                    row.clone(),
-                    MvccRow {
-                        values: row,
-                        created_txn: 0,
-                        deleted_txn: None,
-                    },
-                ),
-                DecodedRow::Versioned(v) => (v.values.clone(), v),
-            };
-
-            if !row_visible(&version, tx_ref) {
-                continue;
-            }
-
-            if let Some(filter) = &self.filter {
-                if !eval_predicate(filter, &row)? {
-                    continue;
+        if let Some((col_idx, value)) = pk_eq_hint.as_ref() {
+            if let Some(matches) = btree_maintenance::lookup_visible_rows(
+                &self.catalog,
+                &self.table_info,
+                *col_idx,
+                value,
+                tx_ref,
+            )? {
+                for (tid, version, expected_bytes) in matches {
+                    if has_delete_conflict(&version, tx_ref) {
+                        return Err(EntDbError::Query(format!(
+                            "write-write conflict on table '{}' tuple {:?}",
+                            self.table_info.name, tid
+                        )));
+                    }
+                    targets.push((tid, version, expected_bytes));
                 }
             }
+        }
 
-            if has_delete_conflict(&version, tx_ref) {
-                return Err(EntDbError::Query(format!(
-                    "write-write conflict on table '{}' tuple {:?}",
-                    self.table_info.name, tid
-                )));
+        if targets.is_empty() {
+            for (tid, tuple) in table.scan() {
+                let stored = decode_stored_row(&tuple.data)?;
+                let (row, version) = match stored {
+                    DecodedRow::Legacy(row) => (
+                        row.clone(),
+                        MvccRow {
+                            values: row,
+                            created_txn: 0,
+                            deleted_txn: None,
+                        },
+                    ),
+                    DecodedRow::Versioned(v) => (v.values.clone(), v),
+                };
+
+                if !row_visible(&version, tx_ref) {
+                    continue;
+                }
+
+                if let Some(filter) = &self.filter {
+                    if !eval_predicate(filter, &row)? {
+                        continue;
+                    }
+                }
+
+                if has_delete_conflict(&version, tx_ref) {
+                    return Err(EntDbError::Query(format!(
+                        "write-write conflict on table '{}' tuple {:?}",
+                        self.table_info.name, tid
+                    )));
+                }
+
+                targets.push((tid, version, tuple.data.clone()));
+                if pk_eq_hint.is_some() {
+                    break;
+                }
             }
-
-            targets.push((tid, version, tuple.data.clone()));
         }
 
         for (tid, mut version, expected_bytes) in targets {
@@ -136,6 +162,7 @@ impl Executor for DeleteExecutor {
                     self.table_info.name, tid
                 )));
             }
+            btree_maintenance::on_delete(&self.catalog, &self.table_info, &version.values)?;
             bm25_maintenance::on_delete(&self.catalog, &self.table_info, tid)?;
             self.affected_rows = self.affected_rows.saturating_add(1);
         }
@@ -154,6 +181,36 @@ impl Executor for DeleteExecutor {
 
     fn affected_rows(&self) -> Option<u64> {
         Some(self.affected_rows)
+    }
+}
+
+fn primary_key_eq_filter_hint(
+    table: &TableInfo,
+    filter: Option<&BoundExpr>,
+) -> Option<(usize, Value)> {
+    let filter = filter?;
+    let (col_idx, value) = match filter {
+        BoundExpr::BinaryOp {
+            op: crate::query::expression::BinaryOp::Eq,
+            left,
+            right,
+        } => match (left.as_ref(), right.as_ref()) {
+            (BoundExpr::ColumnRef { col_idx }, BoundExpr::Literal(v)) => (*col_idx, v.clone()),
+            (BoundExpr::Literal(v), BoundExpr::ColumnRef { col_idx }) => (*col_idx, v.clone()),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if table
+        .schema
+        .columns
+        .get(col_idx)
+        .map(|c| c.primary_key)
+        .unwrap_or(false)
+    {
+        Some((col_idx, value))
+    } else {
+        None
     }
 }
 

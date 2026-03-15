@@ -29,6 +29,13 @@ pub type TxnId = u64;
 const TXN_CHECKPOINT_INTERVAL: u64 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurabilityMode {
+    Full,
+    Normal,
+    Off,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnStatus {
     Active { snapshot_ts: u64 },
     Committed(u64),
@@ -59,6 +66,8 @@ pub struct TransactionManager {
     wal_manager: Option<Arc<LogManager>>,
     wal_checkpoint_lsn: AtomicU64,
     ops_since_checkpoint: AtomicU64,
+    durability_mode: RwLock<DurabilityMode>,
+    checkpoint_interval: AtomicU64,
 }
 
 impl TransactionManager {
@@ -71,6 +80,8 @@ impl TransactionManager {
             wal_manager: None,
             wal_checkpoint_lsn: AtomicU64::new(0),
             ops_since_checkpoint: AtomicU64::new(0),
+            durability_mode: RwLock::new(DurabilityMode::Full),
+            checkpoint_interval: AtomicU64::new(TXN_CHECKPOINT_INTERVAL),
         }
     }
 
@@ -93,6 +104,8 @@ impl TransactionManager {
             wal_manager: None,
             wal_checkpoint_lsn: AtomicU64::new(state.wal_checkpoint_lsn),
             ops_since_checkpoint: AtomicU64::new(0),
+            durability_mode: RwLock::new(DurabilityMode::Full),
+            checkpoint_interval: AtomicU64::new(TXN_CHECKPOINT_INTERVAL),
         };
         tm.persist_state()?;
         Ok(tm)
@@ -104,7 +117,11 @@ impl TransactionManager {
     ) -> Result<Self> {
         let state_path = state_path.as_ref().to_path_buf();
         let state = load_or_default_state(&state_path)?;
-        let wal_manager = Arc::new(LogManager::new(wal_path, 4096)?);
+        let wal_buffer_bytes = std::env::var("ENTDB_WAL_BUFFER_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4096);
+        let wal_manager = Arc::new(LogManager::new(wal_path, wal_buffer_bytes)?);
 
         let mut txns = HashMap::new();
         for (txn_id, ts) in state.committed {
@@ -122,6 +139,8 @@ impl TransactionManager {
             wal_manager: Some(Arc::clone(&wal_manager)),
             wal_checkpoint_lsn: AtomicU64::new(state.wal_checkpoint_lsn),
             ops_since_checkpoint: AtomicU64::new(0),
+            durability_mode: RwLock::new(DurabilityMode::Full),
+            checkpoint_interval: AtomicU64::new(TXN_CHECKPOINT_INTERVAL),
         };
 
         tm.replay_wal_from_checkpoint()?;
@@ -144,7 +163,6 @@ impl TransactionManager {
 
         if let Some(wal) = &self.wal_manager {
             let _ = wal.append(LogRecord::Begin { txn_id });
-            self.record_mutation_noncritical();
         } else {
             let _ = self.persist_state();
         }
@@ -156,6 +174,10 @@ impl TransactionManager {
     }
 
     pub fn commit(&self, txn_id: TxnId) -> Result<u64> {
+        self.commit_with_options(txn_id, None)
+    }
+
+    pub fn commit_with_options(&self, txn_id: TxnId, await_durable: Option<bool>) -> Result<u64> {
         let state = self.txns.read().get(&txn_id).copied();
         match state {
             Some(TxnStatus::Committed(ts)) => return Ok(ts),
@@ -174,7 +196,7 @@ impl TransactionManager {
 
         if let Some(wal) = &self.wal_manager {
             wal.append(LogRecord::Commit { txn_id })?;
-            wal.flush()?;
+            self.flush_wal_for_commit(await_durable)?;
         }
 
         let ts = self.commit_ts.fetch_add(1, Ordering::SeqCst) + 1;
@@ -198,9 +220,12 @@ impl TransactionManager {
         drop(txns);
 
         if self.wal_manager.is_some() {
+            // WAL-backed mode keeps durability via log append+flush above.
+            // Persist txn state on checkpoints instead of every commit.
             self.record_mutation_checkpointed()?;
+        } else {
+            self.persist_state()?;
         }
-        self.persist_state()?;
 
         Ok(ts)
     }
@@ -208,15 +233,16 @@ impl TransactionManager {
     pub fn abort(&self, txn_id: TxnId) {
         if let Some(wal) = &self.wal_manager {
             let _ = wal.append(LogRecord::Abort { txn_id });
-            let _ = wal.flush();
+            let _ = self.flush_wal_for_commit(None);
         }
 
         self.txns.write().insert(txn_id, TxnStatus::Aborted);
 
         if self.wal_manager.is_some() {
             self.record_mutation_noncritical();
+        } else {
+            let _ = self.persist_state();
         }
-        let _ = self.persist_state();
     }
 
     pub fn status(&self, txn_id: TxnId) -> TxnStatus {
@@ -283,7 +309,7 @@ impl TransactionManager {
             wal_checkpoint_lsn: self.wal_checkpoint_lsn.load(Ordering::Acquire),
         };
 
-        let bytes = serde_json::to_vec_pretty(&state)
+        let bytes = serde_json::to_vec(&state)
             .map_err(|e| EntDbError::Corruption(format!("txn state encode failed: {e}")))?;
         fs::write(path, bytes)?;
         Ok(())
@@ -308,10 +334,34 @@ impl TransactionManager {
             .collect::<Vec<_>>();
 
         let lsn = wal.append(LogRecord::Checkpoint { active_txns })?;
-        wal.flush()?;
+        match self.durability_mode() {
+            DurabilityMode::Full => wal.flush()?,
+            DurabilityMode::Normal => wal.flush_no_sync()?,
+            DurabilityMode::Off => wal.flush_no_sync()?,
+        }
         self.wal_checkpoint_lsn.store(lsn, Ordering::Release);
         self.ops_since_checkpoint.store(0, Ordering::Release);
         self.persist_state()
+    }
+
+    pub fn set_durability_mode(&self, mode: DurabilityMode) {
+        *self.durability_mode.write() = mode;
+    }
+
+    pub fn durability_mode(&self) -> DurabilityMode {
+        *self.durability_mode.read()
+    }
+
+    pub fn flush_durable(&self) -> Result<()> {
+        if let Some(wal) = &self.wal_manager {
+            wal.flush()?;
+        }
+        self.persist_state()
+    }
+
+    pub fn set_checkpoint_interval(&self, interval: u64) {
+        let v = interval.max(1);
+        self.checkpoint_interval.store(v, Ordering::Release);
     }
 
     fn replay_wal_from_checkpoint(&self) -> Result<()> {
@@ -366,7 +416,7 @@ impl TransactionManager {
 
     fn record_mutation_checkpointed(&self) -> Result<()> {
         let count = self.ops_since_checkpoint.fetch_add(1, Ordering::SeqCst) + 1;
-        if count >= TXN_CHECKPOINT_INTERVAL {
+        if count >= self.checkpoint_interval.load(Ordering::Acquire) {
             self.checkpoint()?;
         }
         Ok(())
@@ -377,6 +427,22 @@ impl TransactionManager {
             return;
         }
         let _ = self.record_mutation_checkpointed();
+    }
+
+    fn flush_wal_for_commit(&self, await_durable: Option<bool>) -> Result<()> {
+        let Some(wal) = &self.wal_manager else {
+            return Ok(());
+        };
+
+        if await_durable.unwrap_or(false) {
+            return wal.flush();
+        }
+
+        match self.durability_mode() {
+            DurabilityMode::Full => wal.flush(),
+            DurabilityMode::Normal => wal.flush_no_sync(),
+            DurabilityMode::Off => Ok(()),
+        }
     }
 
     fn align_next_txn_id_with_wal_history(&self) -> Result<()> {

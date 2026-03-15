@@ -24,9 +24,10 @@ pub mod types;
 pub mod wal;
 
 pub use error::{EntDbError, Result};
-pub use query::{QueryEngine, QueryOutput};
+pub use query::{BulkUpdate, ExecuteOptions, PreparedStatement, QueryEngine, QueryOutput};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+pub use tx::DurabilityMode;
 
 use crate::catalog::Catalog;
 use crate::storage::buffer_pool::BufferPool;
@@ -37,6 +38,7 @@ pub struct ConnectOptions {
     pub buffer_pool_pages: usize,
     pub durable_txn_metadata: bool,
     pub polyglot_enabled: bool,
+    pub durability_mode: DurabilityMode,
 }
 
 impl Default for ConnectOptions {
@@ -45,6 +47,7 @@ impl Default for ConnectOptions {
             buffer_pool_pages: 256,
             durable_txn_metadata: true,
             polyglot_enabled: false,
+            durability_mode: DurabilityMode::Full,
         }
     }
 }
@@ -66,7 +69,8 @@ impl EntDb {
         let dm = Arc::new(DiskManager::new(&db_file)?);
         let bp = Arc::new(BufferPool::new(opts.buffer_pool_pages, Arc::clone(&dm)));
         let catalog = Arc::new(Catalog::load(Arc::clone(&bp))?);
-        let engine = QueryEngine::with_txn_persistence(catalog, opts.durable_txn_metadata);
+        let engine =
+            QueryEngine::with_txn_options(catalog, opts.durable_txn_metadata, opts.durability_mode);
         engine.set_polyglot_enabled(opts.polyglot_enabled);
         Ok(Self { engine })
     }
@@ -75,8 +79,107 @@ impl EntDb {
         self.engine.execute(sql)
     }
 
+    pub fn execute_with_options(
+        &self,
+        sql: &str,
+        opts: ExecuteOptions,
+    ) -> Result<Vec<QueryOutput>> {
+        self.engine.execute_with_options(sql, opts)
+    }
+
+    pub fn prepare(&self, sql_template: &str) -> PreparedStatement {
+        self.engine.prepare(sql_template)
+    }
+
+    pub fn execute_prepared(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[crate::types::Value],
+    ) -> Result<Vec<QueryOutput>> {
+        self.engine.execute_prepared(prepared, params)
+    }
+
+    pub fn execute_prepared_with_options(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[crate::types::Value],
+        opts: ExecuteOptions,
+    ) -> Result<Vec<QueryOutput>> {
+        self.engine
+            .execute_prepared_with_options(prepared, params, opts)
+    }
+
+    pub fn set_durability_mode(&self, mode: DurabilityMode) {
+        self.engine.set_durability_mode(mode);
+    }
+
+    pub fn insert_many(&self, table_name: &str, rows: &[Vec<crate::types::Value>]) -> Result<u64> {
+        self.engine.insert_many(table_name, rows)
+    }
+
+    pub fn insert_many_with_options(
+        &self,
+        table_name: &str,
+        rows: &[Vec<crate::types::Value>],
+        opts: ExecuteOptions,
+    ) -> Result<u64> {
+        self.engine.insert_many_with_options(table_name, rows, opts)
+    }
+
+    pub fn update_many(
+        &self,
+        table_name: &str,
+        key_column: &str,
+        updates: &[BulkUpdate],
+    ) -> Result<u64> {
+        self.engine.update_many(table_name, key_column, updates)
+    }
+
+    pub fn update_many_with_options(
+        &self,
+        table_name: &str,
+        key_column: &str,
+        updates: &[BulkUpdate],
+        opts: ExecuteOptions,
+    ) -> Result<u64> {
+        self.engine
+            .update_many_with_options(table_name, key_column, updates, opts)
+    }
+
+    pub fn delete_many(
+        &self,
+        table_name: &str,
+        key_column: &str,
+        keys: &[crate::types::Value],
+    ) -> Result<u64> {
+        self.engine.delete_many(table_name, key_column, keys)
+    }
+
+    pub fn delete_many_with_options(
+        &self,
+        table_name: &str,
+        key_column: &str,
+        keys: &[crate::types::Value],
+        opts: ExecuteOptions,
+    ) -> Result<u64> {
+        self.engine
+            .delete_many_with_options(table_name, key_column, keys, opts)
+    }
+
+    pub fn durability_mode(&self) -> DurabilityMode {
+        self.engine.durability_mode()
+    }
+
     pub fn close(&self) -> Result<()> {
         self.engine.flush_all()
+    }
+
+    pub fn flush_durable(&self) -> Result<()> {
+        self.engine.flush_durable()
+    }
+
+    pub fn set_checkpoint_interval(&self, interval: u64) {
+        self.engine.set_checkpoint_interval(interval);
     }
 
     pub fn engine(&self) -> &QueryEngine {

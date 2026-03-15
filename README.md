@@ -18,6 +18,9 @@ EntDB is a Rust-based SQL database engine with a PostgreSQL wire-compatible serv
 - Page-based storage engine with buffer pool and B+Tree index internals.
 - WAL + restart recovery.
 - MVCC transactions (`BEGIN`/`COMMIT`/`ROLLBACK`).
+- Configurable commit durability: `Full`, `Normal`, `Off`.
+- Prepared execution fast paths for common point reads and simple DML.
+- Batched embedded APIs for `insert_many`, `update_many`, and `delete_many`.
 - SQL subset for OLTP-style workloads.
 - pgwire server for `psql` and PostgreSQL drivers.
 
@@ -129,6 +132,27 @@ fn main() -> entdb::Result<()> {
 }
 ```
 
+## Core Execution Model
+
+- `CREATE INDEX ... USING btree` builds a real B-tree over existing rows.
+- Single-column equality filters can route through index lookup instead of a table scan.
+- DML maintains those B-tree indexes on `INSERT`, `UPDATE`, `DELETE`, `UPSERT`, and `INSERT ... SELECT`.
+- Durability is policy-driven:
+  - `DurabilityMode::Full`: strict sync on commit
+  - `DurabilityMode::Normal`: reduced sync pressure with crash-safe recovery semantics
+  - `DurabilityMode::Off`: best-effort durability for ephemeral or scratch workloads
+- Embedded callers can override per-call durability with:
+  - `ExecuteOptions { await_durable: Some(true) }`
+- Prepared statements now have a narrow fast path for:
+  - `SELECT ... FROM t`
+  - `SELECT ... FROM t WHERE col = $1`
+  - `SELECT COUNT(*) ... WHERE col OP $1`
+  - simple keyed `INSERT`, `UPDATE`, and `DELETE`
+- Bulk APIs avoid parser/binder/planner churn on repeated writes:
+  - `insert_many`
+  - `update_many`
+  - `delete_many`
+
 ## Smoke tests
 
 ```bash
@@ -136,6 +160,52 @@ fn main() -> entdb::Result<()> {
 ./scripts/run_psql_polyglot_smoke.sh "host=127.0.0.1 port=5433 user=entdb password=entdb dbname=entdb"
 ./scripts/run_psql_vector_bm25_smoke.sh "host=127.0.0.1 port=5433 user=entdb password=entdb dbname=entdb"
 ```
+
+## Benchmark Snapshot
+
+Environment:
+
+- Criterion benchmark medians from local `cargo bench` runs.
+- SQLite write-path runs are shown in both `synchronous=FULL` and `synchronous=NORMAL` where that comparison is meaningful.
+- Prepared read rows are only compared against prepared SQLite rows.
+
+Write workload (`cargo bench -p entdb --bench workload_bench -- --noplot`):
+
+| Operation | EntDB Full | EntDB Normal | SQLite Full | SQLite Normal |
+|---|---:|---:|---:|---:|
+| INSERT 100 (no txn) | 462.20 ms | 11.201 ms | 7.0020 ms | 2.1716 ms |
+| UPDATE 100 | 481.27 ms | 16.221 ms | 7.1612 ms | 2.1869 ms |
+| DELETE 100 | 483.43 ms | 13.683 ms | 7.2658 ms | 2.1430 ms |
+| TRANSACTION batch | 15.268 ms | 12.830 ms | 390.08 us | 403.73 us |
+
+Read workload:
+
+| Operation | EntDB | EntDB Prepared | SQLite | SQLite Prepared |
+|---|---:|---:|---:|---:|
+| SELECT ALL 100 | 45.359 us | 38.762 us | 12.181 us | 10.886 us |
+| SELECT BY ID x100 | 1.0403 ms | 196.61 us | 254.11 us | 122.53 us |
+
+Bulk embedded APIs:
+
+| Operation | EntDB Full | EntDB Normal |
+|---|---:|---:|
+| insert_many (100 rows) | 5.7793 ms | 955.16 us |
+| update_many (100 rows) | 11.465 ms | 7.1166 ms |
+| delete_many (100 rows) | 9.6819 ms | 4.6883 ms |
+
+Comparative microbench (`cargo bench -p entdb --bench comparative_bench -- --noplot`):
+
+| Operation | EntDB API | EntDB Prepared | SQLite API | SQLite Prepared |
+|---|---:|---:|---:|---:|
+| COUNT WHERE | 9.8194 ms | 8.5285 ms | 484.76 us | 485.46 us |
+| ORDER BY LIMIT | 9.3891 ms | 9.3134 ms | 679.79 us | 658.22 us |
+
+Notes:
+
+- `DurabilityMode::Normal` is the practical throughput mode for app writes.
+- Prepared point lookups improved materially, but SQLite prepared is still faster.
+- Bulk APIs are the honest best-case EntDB write path for repeated keyed mutations.
+- The largest remaining gap is scan/sort/aggregate execution, not indexed equality lookup.
 
 ## Docs
 

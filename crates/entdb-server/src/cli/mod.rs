@@ -63,6 +63,12 @@ pub struct Cli {
     #[arg(long)]
     pub auth_password_file: Option<String>,
 
+    #[arg(long, default_value = "full", value_parser = ["full", "normal", "off"])]
+    pub durability_mode: String,
+
+    #[arg(long)]
+    pub await_durable: bool,
+
     #[arg(long)]
     pub tls_cert: Option<String>,
 
@@ -91,5 +97,16 @@ mod tests {
     fn cli_parses_host_without_short_conflict() {
         let cli = Cli::parse_from(["entdb", "--host", "0.0.0.0"]);
         assert_eq!(cli.host, "0.0.0.0");
+    }
+
+    #[test]
+    fn cli_parses_durability_mode_flags() {
+        let cli = Cli::parse_from(["entdb", "--durability-mode", "normal", "--await-durable"]);
+        assert_eq!(cli.durability_mode, "normal");
+        assert!(cli.await_durable);
+
+        let off = Cli::parse_from(["entdb", "--durability-mode", "off"]);
+        assert_eq!(off.durability_mode, "off");
+        assert!(!off.await_durable);
     }
 }

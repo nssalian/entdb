@@ -164,8 +164,12 @@ impl Binder {
     }
 
     pub fn bind(&self, stmt: &Statement) -> Result<BoundStatement> {
+        self.bind_with_params(stmt, &[])
+    }
+
+    pub fn bind_with_params(&self, stmt: &Statement, params: &[Value]) -> Result<BoundStatement> {
         match stmt {
-            Statement::Query(query) => self.bind_query(query),
+            Statement::Query(query) => self.bind_query_with_params(query, params),
             Statement::Insert(insert) => {
                 let table_name = match &insert.table {
                     TableObject::TableName(name) => object_name_to_string(name),
@@ -198,7 +202,7 @@ impl Binder {
 
                             let mut bound_row = Vec::new();
                             for (expr, col) in row.iter().zip(&table.schema.columns) {
-                                let v = bind_literal(expr)?;
+                                let v = bind_value(expr, params)?;
                                 let casted = v.cast_to(&col.data_type).map_err(|e| {
                                     EntDbError::Query(format!(
                                         "cannot cast value for column '{}': {e}",
@@ -218,7 +222,7 @@ impl Binder {
                                     .to_string(),
                             ));
                         }
-                        let source_stmt = self.bind_query(source_query)?;
+                        let source_stmt = self.bind_query_with_params(source_query, params)?;
                         return Ok(BoundStatement::InsertSelect {
                             table,
                             source: Box::new(source_stmt),
@@ -227,7 +231,7 @@ impl Binder {
                 };
 
                 if let Some(on_insert) = &insert.on {
-                    let (conflict_cols, action) = bind_on_conflict(on_insert, &table)?;
+                    let (conflict_cols, action) = bind_on_conflict(on_insert, &table, params)?;
                     return Ok(BoundStatement::Upsert {
                         table,
                         rows,
@@ -271,15 +275,20 @@ impl Binder {
 
                 let mut bound_assignments = Vec::with_capacity(assignments.len());
                 for a in assignments {
-                    bound_assignments.push(bind_update_assignment(a, &target_table, &scope)?);
+                    bound_assignments.push(bind_update_assignment(
+                        a,
+                        &target_table,
+                        &scope,
+                        params,
+                    )?);
                 }
 
                 let mut filter = match selection {
-                    Some(expr) => Some(bind_expr(expr, &scope)?),
+                    Some(expr) => Some(bind_expr(expr, &scope, params)?),
                     None => None,
                 };
                 for join_expr in from_join_predicates {
-                    let bound = bind_expr(&join_expr, &scope)?;
+                    let bound = bind_expr(&join_expr, &scope, params)?;
                     filter = Some(match filter {
                         None => bound,
                         Some(existing) => BoundExpr::BinaryOp {
@@ -332,14 +341,14 @@ impl Binder {
                 }
 
                 let mut filter = match &delete.selection {
-                    Some(expr) => Some(bind_expr(expr, &scope)?),
+                    Some(expr) => Some(bind_expr(expr, &scope, params)?),
                     None => None,
                 };
                 for join_expr in from_join_predicates
                     .into_iter()
                     .chain(using_join_predicates.into_iter())
                 {
-                    let bound = bind_expr(&join_expr, &scope)?;
+                    let bound = bind_expr(&join_expr, &scope, params)?;
                     filter = Some(match filter {
                         None => bound,
                         Some(existing) => BoundExpr::BinaryOp {
@@ -524,11 +533,11 @@ impl Binder {
         }
     }
 
-    fn bind_query(&self, query: &Query) -> Result<BoundStatement> {
+    fn bind_query_with_params(&self, query: &Query, params: &[Value]) -> Result<BoundStatement> {
         let mut ctes = std::collections::HashMap::new();
         if let Some(with) = &query.with {
             for cte in &with.cte_tables {
-                let bound = self.bind_query(&cte.query)?;
+                let bound = self.bind_query_with_params(&cte.query, params)?;
                 let schema = bound_statement_schema(&bound)?;
                 ctes.insert(
                     cte.alias.name.value.clone(),
@@ -541,7 +550,7 @@ impl Binder {
         }
 
         match &*query.body {
-            SetExpr::Select(select) => self.bind_select(select, query, &ctes),
+            SetExpr::Select(select) => self.bind_select(select, query, &ctes, params),
             SetExpr::SetOperation {
                 op,
                 set_quantifier,
@@ -553,32 +562,38 @@ impl Binder {
                         "only UNION/UNION ALL set operations are supported".to_string(),
                     ));
                 }
-                let left_stmt = self.bind_query(&Query {
-                    with: None,
-                    body: left.clone(),
-                    order_by: None,
-                    limit: None,
-                    limit_by: vec![],
-                    offset: None,
-                    fetch: None,
-                    locks: vec![],
-                    for_clause: None,
-                    settings: None,
-                    format_clause: None,
-                })?;
-                let right_stmt = self.bind_query(&Query {
-                    with: None,
-                    body: right.clone(),
-                    order_by: None,
-                    limit: None,
-                    limit_by: vec![],
-                    offset: None,
-                    fetch: None,
-                    locks: vec![],
-                    for_clause: None,
-                    settings: None,
-                    format_clause: None,
-                })?;
+                let left_stmt = self.bind_query_with_params(
+                    &Query {
+                        with: None,
+                        body: left.clone(),
+                        order_by: None,
+                        limit: None,
+                        limit_by: vec![],
+                        offset: None,
+                        fetch: None,
+                        locks: vec![],
+                        for_clause: None,
+                        settings: None,
+                        format_clause: None,
+                    },
+                    params,
+                )?;
+                let right_stmt = self.bind_query_with_params(
+                    &Query {
+                        with: None,
+                        body: right.clone(),
+                        order_by: None,
+                        limit: None,
+                        limit_by: vec![],
+                        offset: None,
+                        fetch: None,
+                        locks: vec![],
+                        for_clause: None,
+                        settings: None,
+                        format_clause: None,
+                    },
+                    params,
+                )?;
                 let left_schema = bound_statement_schema(&left_stmt)?;
                 let right_schema = bound_statement_schema(&right_stmt)?;
                 if left_schema.columns.len() != right_schema.columns.len() {
@@ -601,9 +616,10 @@ impl Binder {
         select: &Select,
         query: &Query,
         ctes: &std::collections::HashMap<String, BoundSource>,
+        params: &[Value],
     ) -> Result<BoundStatement> {
         if select.from.is_empty() {
-            return self.bind_select_without_from(select, query);
+            return self.bind_select_without_from(select, query, params);
         }
         if select.from.len() != 1 {
             return Err(EntDbError::Query(
@@ -611,14 +627,14 @@ impl Binder {
             ));
         }
 
-        let (source, scope) = self.bind_source(&select.from[0], ctes)?;
+        let (source, scope) = self.bind_source(&select.from[0], ctes, params)?;
 
-        let projection_result = bind_projection(&select.projection, &scope)?;
+        let projection_result = bind_projection(&select.projection, &scope, params)?;
 
         let aggregate = bind_aggregate(&select.group_by, &projection_result)?;
 
         let filter = match &select.selection {
-            Some(expr) => Some(bind_expr(expr, &scope)?),
+            Some(expr) => Some(bind_expr(expr, &scope, params)?),
             None => None,
         };
 
@@ -668,7 +684,12 @@ impl Binder {
         })
     }
 
-    fn bind_select_without_from(&self, select: &Select, query: &Query) -> Result<BoundStatement> {
+    fn bind_select_without_from(
+        &self,
+        select: &Select,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<BoundStatement> {
         if select.distinct.is_some() {
             return Err(EntDbError::Query(
                 "SELECT DISTINCT without FROM is not supported".to_string(),
@@ -720,7 +741,7 @@ impl Binder {
                     ))
                 }
             };
-            let value = bind_literal(expr)?;
+            let value = bind_value(expr, params)?;
             let data_type = value.data_type();
             values.push(value);
             names.push(out_name.clone());
@@ -787,11 +808,14 @@ impl Binder {
         &self,
         from: &TableWithJoins,
         ctes: &std::collections::HashMap<String, BoundSource>,
+        params: &[Value],
     ) -> Result<(BoundSource, Vec<ScopeColumn>)> {
-        let (mut source, mut scope) = self.bind_relation_with_alias(&from.relation, ctes)?;
+        let (mut source, mut scope) =
+            self.bind_relation_with_alias(&from.relation, ctes, params)?;
 
         for join in &from.joins {
-            let (right, right_scope) = self.bind_relation_with_alias(&join.relation, ctes)?;
+            let (right, right_scope) =
+                self.bind_relation_with_alias(&join.relation, ctes, params)?;
             let on_expr = match &join.join_operator {
                 JoinOperator::Inner(JoinConstraint::On(expr))
                 | JoinOperator::Join(JoinConstraint::On(expr)) => expr,
@@ -829,6 +853,7 @@ impl Binder {
         &self,
         relation: &TableFactor,
         ctes: &std::collections::HashMap<String, BoundSource>,
+        params: &[Value],
     ) -> Result<(BoundSource, Vec<ScopeColumn>)> {
         match relation {
             TableFactor::Table { name, alias, .. } => {
@@ -855,7 +880,7 @@ impl Binder {
             TableFactor::Derived {
                 subquery, alias, ..
             } => {
-                let bound = self.bind_query(subquery)?;
+                let bound = self.bind_query_with_params(subquery, params)?;
                 let schema = bound_statement_schema(&bound)?;
                 let alias_name = alias
                     .as_ref()
@@ -889,7 +914,11 @@ struct AggregateProjection {
     aggregates: Vec<AggregateExprBinding>,
 }
 
-fn bind_projection(items: &[SelectItem], scope: &[ScopeColumn]) -> Result<ProjectionBinding> {
+fn bind_projection(
+    items: &[SelectItem],
+    scope: &[ScopeColumn],
+    params: &[Value],
+) -> Result<ProjectionBinding> {
     if items.len() == 1 && matches!(items[0], SelectItem::Wildcard(_)) {
         let cols = scope
             .iter()
@@ -943,16 +972,16 @@ fn bind_projection(items: &[SelectItem], scope: &[ScopeColumn]) -> Result<Projec
             continue;
         }
         if saw_aggregate {
-            return Ok(non_aggregate_projection(items, scope)?);
+            return Ok(non_aggregate_projection(items, scope, params)?);
         }
         let (expr, alias) = match item {
             SelectItem::UnnamedExpr(expr) => (expr, None),
             SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
-            _ => return Ok(non_aggregate_projection(items, scope)?),
+            _ => return Ok(non_aggregate_projection(items, scope, params)?),
         };
         let col_idx = match resolve_column_ref(expr, scope) {
             Ok(v) => v,
-            Err(_) => return Ok(non_aggregate_projection(items, scope)?),
+            Err(_) => return Ok(non_aggregate_projection(items, scope, params)?),
         };
         let col_name = alias.unwrap_or(column_name_for_expr(expr)?);
         group_keys.push(GroupKey {
@@ -975,12 +1004,13 @@ fn bind_projection(items: &[SelectItem], scope: &[ScopeColumn]) -> Result<Projec
         });
     }
 
-    non_aggregate_projection(items, scope)
+    non_aggregate_projection(items, scope, params)
 }
 
 fn non_aggregate_projection(
     items: &[SelectItem],
     scope: &[ScopeColumn],
+    params: &[Value],
 ) -> Result<ProjectionBinding> {
     let mut idxs = Vec::new();
     let mut exprs = Vec::new();
@@ -996,7 +1026,7 @@ fn non_aggregate_projection(
                     }
                     Err(_) => {
                         all_refs = false;
-                        exprs.push(bind_expr(expr, scope)?);
+                        exprs.push(bind_expr(expr, scope, params)?);
                     }
                 }
                 names.push(column_name_for_select_expr(expr, None)?);
@@ -1009,7 +1039,7 @@ fn non_aggregate_projection(
                     }
                     Err(_) => {
                         all_refs = false;
-                        exprs.push(bind_expr(expr, scope)?);
+                        exprs.push(bind_expr(expr, scope, params)?);
                     }
                 }
                 names.push(alias.value.clone());
@@ -1245,6 +1275,7 @@ fn bind_update_assignment(
     assignment: &Assignment,
     table: &TableInfo,
     scope: &[ScopeColumn],
+    params: &[Value],
 ) -> Result<UpdateAssignment> {
     let col_name = match &assignment.target {
         AssignmentTarget::ColumnName(obj) => {
@@ -1270,11 +1301,15 @@ fn bind_update_assignment(
         .column_index(&col_name)
         .ok_or_else(|| EntDbError::Query(format!("column '{col_name}' does not exist")))?;
 
-    let expr = bind_expr(&assignment.value, scope)?;
+    let expr = bind_expr(&assignment.value, scope, params)?;
     Ok(UpdateAssignment { col_idx, expr })
 }
 
-fn bind_on_conflict(on_insert: &OnInsert, table: &TableInfo) -> Result<(Vec<usize>, UpsertAction)> {
+fn bind_on_conflict(
+    on_insert: &OnInsert,
+    table: &TableInfo,
+    params: &[Value],
+) -> Result<(Vec<usize>, UpsertAction)> {
     let OnInsert::OnConflict(on_conflict) = on_insert else {
         return Err(EntDbError::Query(
             "only ON CONFLICT is supported for UPSERT".to_string(),
@@ -1316,10 +1351,10 @@ fn bind_on_conflict(on_insert: &OnInsert, table: &TableInfo) -> Result<(Vec<usiz
             ));
             let mut assignments = Vec::with_capacity(update.assignments.len());
             for a in &update.assignments {
-                assignments.push(bind_update_assignment(a, table, &scope)?);
+                assignments.push(bind_update_assignment(a, table, &scope, params)?);
             }
             let selection = match &update.selection {
-                Some(expr) => Some(bind_expr(expr, &scope)?),
+                Some(expr) => Some(bind_expr(expr, &scope, params)?),
                 None => None,
             };
             UpsertAction::DoUpdate {
@@ -1580,7 +1615,60 @@ fn column_name_for_select_expr(expr: &Expr, fallback: Option<String>) -> Result<
     }
 }
 
-fn bind_expr(expr: &Expr, scope: &[ScopeColumn]) -> Result<BoundExpr> {
+fn bind_value(expr: &Expr, params: &[Value]) -> Result<Value> {
+    match expr {
+        Expr::Value(v) => match &v.value {
+            sqlparser::ast::Value::Placeholder(placeholder) => {
+                bind_param_value(placeholder, params)
+            }
+            _ => bind_literal(expr),
+        },
+        Expr::UnaryOp { op, expr } => {
+            let inner = bind_value(expr, params)?;
+            match op {
+                UnaryOperator::Plus => Ok(inner),
+                UnaryOperator::Minus => match inner {
+                    Value::Int16(v) => Ok(Value::Int16(v.saturating_neg())),
+                    Value::Int32(v) => Ok(Value::Int32(v.saturating_neg())),
+                    Value::Int64(v) => Ok(Value::Int64(v.saturating_neg())),
+                    Value::Float64(v) => Ok(Value::Float64(-v)),
+                    _ => Err(EntDbError::Query(
+                        "unary '-' requires numeric literal".to_string(),
+                    )),
+                },
+                _ => Err(EntDbError::Query(
+                    "unsupported unary operator in literal".to_string(),
+                )),
+            }
+        }
+        _ => Err(EntDbError::Query("expected literal expression".to_string())),
+    }
+}
+
+fn bind_param_value(placeholder: &str, params: &[Value]) -> Result<Value> {
+    let trimmed = placeholder.trim();
+    let index_str = if let Some(rest) = trimmed.strip_prefix('$') {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix('?') {
+        rest
+    } else {
+        return Err(EntDbError::Query(
+            "only numeric placeholders are supported ($1/ ?1)".to_string(),
+        ));
+    };
+    let index = index_str
+        .parse::<usize>()
+        .map_err(|_| EntDbError::Query(format!("invalid parameter marker '{placeholder}'")))?;
+    if index == 0 || index > params.len() {
+        return Err(EntDbError::Query(format!(
+            "parameter ${index} out of bounds (have {} values)",
+            params.len()
+        )));
+    }
+    Ok(params[index - 1].clone())
+}
+
+fn bind_expr(expr: &Expr, scope: &[ScopeColumn], params: &[Value]) -> Result<BoundExpr> {
     match expr {
         Expr::BinaryOp { left, op, right } => {
             let bop = match op {
@@ -1612,8 +1700,8 @@ fn bind_expr(expr: &Expr, scope: &[ScopeColumn]) -> Result<BoundExpr> {
                 },
             };
 
-            let l = bind_expr(left, scope)?;
-            let r = bind_expr(right, scope)?;
+            let l = bind_expr(left, scope, params)?;
+            let r = bind_expr(right, scope, params)?;
             Ok(BoundExpr::BinaryOp {
                 op: bop,
                 left: Box::new(l),
@@ -1624,7 +1712,7 @@ fn bind_expr(expr: &Expr, scope: &[ScopeColumn]) -> Result<BoundExpr> {
             let idx = resolve_column_ref(expr, scope)?;
             Ok(BoundExpr::ColumnRef { col_idx: idx })
         }
-        Expr::Function(func) => bind_function_expr(func, scope),
+        Expr::Function(func) => bind_function_expr(func, scope, params),
         Expr::Trim {
             expr,
             trim_where,
@@ -1638,25 +1726,29 @@ fn bind_expr(expr: &Expr, scope: &[ScopeColumn]) -> Result<BoundExpr> {
             }
             Ok(BoundExpr::Function {
                 name: "trim".to_string(),
-                args: vec![bind_expr(expr, scope)?],
+                args: vec![bind_expr(expr, scope, params)?],
             })
         }
-        Expr::Nested(inner) => bind_expr(inner, scope),
+        Expr::Nested(inner) => bind_expr(inner, scope, params),
         Expr::UnaryOp { op, expr } => match op {
-            UnaryOperator::Plus => bind_expr(expr, scope),
+            UnaryOperator::Plus => bind_expr(expr, scope, params),
             UnaryOperator::Minus => Ok(BoundExpr::BinaryOp {
                 op: BinaryOp::Sub,
                 left: Box::new(BoundExpr::Literal(Value::Int64(0))),
-                right: Box::new(bind_expr(expr, scope)?),
+                right: Box::new(bind_expr(expr, scope, params)?),
             }),
             _ => Err(EntDbError::Query("unsupported unary operator".to_string())),
         },
-        Expr::Value(_) => Ok(BoundExpr::Literal(bind_literal(expr)?)),
+        Expr::Value(_) => Ok(BoundExpr::Literal(bind_value(expr, params)?)),
         _ => Err(EntDbError::Query("unsupported expression".to_string())),
     }
 }
 
-fn bind_function_expr(func: &sqlparser::ast::Function, scope: &[ScopeColumn]) -> Result<BoundExpr> {
+fn bind_function_expr(
+    func: &sqlparser::ast::Function,
+    scope: &[ScopeColumn],
+    params: &[Value],
+) -> Result<BoundExpr> {
     let name = func.name.to_string().to_lowercase();
 
     if name == "row_number" {
@@ -1705,7 +1797,7 @@ fn bind_function_expr(func: &sqlparser::ast::Function, scope: &[ScopeColumn]) ->
                 "wildcard function arguments are not supported here".to_string(),
             ));
         };
-        bound_args.push(bind_expr(expr, scope)?);
+        bound_args.push(bind_expr(expr, scope, params)?);
     }
 
     Ok(BoundExpr::Function {

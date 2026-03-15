@@ -57,6 +57,7 @@ pub struct EntHandler {
     query_timeout_ms: u64,
     metrics: Arc<ServerMetrics>,
     polyglot: PolyglotOptions,
+    await_durable: bool,
 }
 
 impl EntHandler {
@@ -65,6 +66,7 @@ impl EntHandler {
         max_statement_bytes: usize,
         query_timeout_ms: u64,
         metrics: Arc<ServerMetrics>,
+        await_durable: bool,
     ) -> Self {
         Self {
             db,
@@ -73,6 +75,7 @@ impl EntHandler {
             max_statement_bytes,
             query_timeout_ms,
             metrics,
+            await_durable,
             polyglot: PolyglotOptions {
                 enabled: std::env::var("ENTDB_POLYGLOT")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -132,7 +135,7 @@ impl EntHandler {
                     };
                     self.db
                         .txn_manager
-                        .commit(tx.txn_id)
+                        .commit_with_options(tx.txn_id, Some(self.await_durable))
                         .map_err(map_entdb_error)?;
                     responses.push(Response::TransactionEnd(Tag::new("COMMIT")));
                 }
@@ -154,7 +157,11 @@ impl EntHandler {
                         let tx = self.db.txn_manager.begin();
                         match self.execute_statement_in_txn(&tx, stmt, max_rows, None) {
                             Ok(resp) => {
-                                if let Err(e) = self.db.txn_manager.commit(tx.txn_id) {
+                                if let Err(e) = self
+                                    .db
+                                    .txn_manager
+                                    .commit_with_options(tx.txn_id, Some(self.await_durable))
+                                {
                                     self.db.txn_manager.abort(tx.txn_id);
                                     return Err(map_entdb_error(e));
                                 }
@@ -550,7 +557,11 @@ impl ExtendedQueryHandler for EntHandler {
                 Some(&portal.result_column_format),
             ) {
                 Ok(resp) => {
-                    if let Err(e) = self.db.txn_manager.commit(tx.txn_id) {
+                    if let Err(e) = self
+                        .db
+                        .txn_manager
+                        .commit_with_options(tx.txn_id, Some(self.await_durable))
+                    {
                         self.db.txn_manager.abort(tx.txn_id);
                         Err(map_entdb_error(e))
                     } else {
@@ -1084,6 +1095,7 @@ mod tests {
             1024 * 1024,
             30_000,
             Arc::new(super::ServerMetrics::default()),
+            false,
         )
     }
 

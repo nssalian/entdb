@@ -53,7 +53,7 @@ impl DiskManager {
             let mut meta_page = Page::new(0);
             write_free_list_to_page(&mut meta_page, &[])?;
             db_file.write_at(meta_page.data(), 0)?;
-            db_file.sync_all()?;
+            db_file.sync_data()?;
         }
 
         let mgr = Self {
@@ -181,7 +181,7 @@ impl DiskManager {
                 "failpoint: disk.sync",
             )));
         }
-        self.db_file.sync_all()?;
+        self.db_file.sync_data()?;
         Ok(())
     }
 

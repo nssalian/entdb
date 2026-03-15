@@ -28,6 +28,9 @@ pub struct SeqScanExecutor {
     catalog: Arc<Catalog>,
     iter: Option<crate::storage::table::TableIterator>,
     tx: Option<TxExecutionContext>,
+    eq_filter: Option<(usize, Value)>,
+    stop_after_first_match: bool,
+    seen_match: bool,
 }
 
 impl SeqScanExecutor {
@@ -36,11 +39,24 @@ impl SeqScanExecutor {
         catalog: Arc<Catalog>,
         tx: Option<TxExecutionContext>,
     ) -> Self {
+        Self::new_with_eq_filter(table_info, catalog, tx, None, false)
+    }
+
+    pub fn new_with_eq_filter(
+        table_info: TableInfo,
+        catalog: Arc<Catalog>,
+        tx: Option<TxExecutionContext>,
+        eq_filter: Option<(usize, Value)>,
+        stop_after_first_match: bool,
+    ) -> Self {
         Self {
             table_info,
             catalog,
             iter: None,
             tx,
+            eq_filter,
+            stop_after_first_match,
+            seen_match: false,
         }
     }
 }
@@ -53,6 +69,7 @@ impl Executor for SeqScanExecutor {
             self.catalog.buffer_pool(),
         );
         self.iter = Some(table.scan());
+        self.seen_match = false;
         Ok(())
     }
 
@@ -60,13 +77,26 @@ impl Executor for SeqScanExecutor {
         let Some(iter) = self.iter.as_mut() else {
             return Ok(None);
         };
+        if self.stop_after_first_match && self.seen_match {
+            return Ok(None);
+        }
 
         loop {
             match iter.next() {
                 Some((_tid, tuple)) => match decode_stored_row(&tuple.data)? {
-                    DecodedRow::Legacy(row) => return Ok(Some(row)),
+                    DecodedRow::Legacy(row) => {
+                        if !matches_eq_filter(&self.eq_filter, &row)? {
+                            continue;
+                        }
+                        self.seen_match = true;
+                        return Ok(Some(row));
+                    }
                     DecodedRow::Versioned(version) => {
                         if row_visible(&version, self.tx.as_ref()) {
+                            if !matches_eq_filter(&self.eq_filter, &version.values)? {
+                                continue;
+                            }
+                            self.seen_match = true;
                             return Ok(Some(version.values));
                         }
                     }
@@ -78,10 +108,21 @@ impl Executor for SeqScanExecutor {
 
     fn close(&mut self) -> Result<()> {
         self.iter = None;
+        self.seen_match = false;
         Ok(())
     }
 
     fn schema(&self) -> &Schema {
         &self.table_info.schema
     }
+}
+
+fn matches_eq_filter(filter: &Option<(usize, Value)>, row: &[Value]) -> Result<bool> {
+    let Some((idx, needle)) = filter else {
+        return Ok(true);
+    };
+    let Some(actual) = row.get(*idx) else {
+        return Ok(false);
+    };
+    actual.eq(needle)
 }

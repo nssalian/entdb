@@ -28,7 +28,7 @@ use entdb::query::optimizer::OptimizerConfig;
 use entdb::storage::buffer_pool::BufferPool;
 use entdb::storage::buffer_pool::BufferPoolStats;
 use entdb::storage::disk_manager::DiskManager;
-use entdb::tx::TransactionManager;
+use entdb::tx::{DurabilityMode, TransactionManager};
 use entdb::wal::log_manager::LogManager;
 use entdb::wal::recovery::RecoveryManager;
 use futures::Sink;
@@ -67,6 +67,8 @@ pub struct ServerConfig {
     pub auth_password: String,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
+    pub durability_mode: DurabilityMode,
+    pub await_durable: bool,
 }
 
 impl ServerConfig {
@@ -153,7 +155,11 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn open(data_path: &Path, buffer_pool_size: usize) -> Result<Self> {
+    pub fn open(
+        data_path: &Path,
+        buffer_pool_size: usize,
+        durability_mode: DurabilityMode,
+    ) -> Result<Self> {
         let disk_manager = Arc::new(DiskManager::new(data_path)?);
 
         let mut wal_path = data_path.to_path_buf();
@@ -179,6 +185,7 @@ impl Database {
         let txn_manager = TransactionManager::with_wal_persistence(&txn_state_path, &txn_wal_path)
             .or_else(|_| TransactionManager::with_persistence(&txn_state_path))
             .unwrap_or_else(|_| TransactionManager::new());
+        txn_manager.set_durability_mode(durability_mode);
 
         if let Ok(max_txn) = scan_max_txn_id_from_storage(&catalog) {
             txn_manager.ensure_min_next_txn_id(max_txn.saturating_add(1));
@@ -328,6 +335,7 @@ impl EntHandlerFactory {
                 config.max_statement_bytes,
                 config.query_timeout_ms,
                 metrics,
+                config.await_durable,
             )),
         }
     }
@@ -364,7 +372,11 @@ impl PgWireServerHandlers for EntHandlerFactory {
 pub async fn run(config: ServerConfig) -> Result<()> {
     config.validate()?;
     let config = Arc::new(config);
-    let database = Arc::new(Database::open(&config.data_path, config.buffer_pool_size)?);
+    let database = Arc::new(Database::open(
+        &config.data_path,
+        config.buffer_pool_size,
+        config.durability_mode,
+    )?);
     let tls_acceptor = build_tls_acceptor(&config)?;
     let listener = TcpListener::bind(config.listen_addr()).await?;
     serve(listener, config, database, tls_acceptor, None).await
@@ -471,6 +483,7 @@ mod tests {
     use super::{serve, Database, ServerConfig};
     use entdb::catalog::{Column, Schema};
     use entdb::types::DataType;
+    use entdb::DurabilityMode;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::net::TcpListener;
@@ -480,7 +493,7 @@ mod tests {
     async fn server_accepts_and_stops_with_shutdown_signal() {
         let dir = tempdir().expect("tempdir");
         let data_path = dir.path().join("server.db");
-        let db = Arc::new(Database::open(&data_path, 64).expect("open db"));
+        let db = Arc::new(Database::open(&data_path, 64, DurabilityMode::Full).expect("open db"));
         let cfg = Arc::new(ServerConfig {
             data_path,
             host: "127.0.0.1".to_string(),
@@ -495,6 +508,8 @@ mod tests {
             auth_password: "entdb".to_string(),
             tls_cert: None,
             tls_key: None,
+            durability_mode: DurabilityMode::Full,
+            await_durable: false,
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
 
@@ -525,6 +540,8 @@ mod tests {
             auth_password: "".to_string(),
             tls_cert: None,
             tls_key: None,
+            durability_mode: DurabilityMode::Full,
+            await_durable: false,
         };
         assert!(cfg.validate().is_err());
     }
@@ -533,7 +550,7 @@ mod tests {
     fn database_open_rejects_catalog_with_missing_table_page() {
         let dir = tempdir().expect("tempdir");
         let data_path = dir.path().join("server-corrupt.db");
-        let db = Database::open(&data_path, 64).expect("open db");
+        let db = Database::open(&data_path, 64, DurabilityMode::Full).expect("open db");
         let schema = Schema::new(vec![
             Column {
                 name: "id".to_string(),
@@ -560,7 +577,7 @@ mod tests {
             .expect("delete table root page to simulate corruption");
         drop(db);
 
-        let err = match Database::open(&data_path, 64) {
+        let err = match Database::open(&data_path, 64, DurabilityMode::Full) {
             Ok(_) => panic!("expected startup integrity validation failure"),
             Err(e) => e,
         };

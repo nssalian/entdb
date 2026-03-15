@@ -2,6 +2,14 @@
 
 EntDB durability and restart safety are driven by WAL-first write semantics and deterministic recovery.
 
+Durability policy is configurable at runtime:
+
+- `Full`: strict sync on commit path
+- `Normal`: reduced sync pressure with the same recovery model
+- `Off`: best-effort durability for ephemeral workloads
+
+Callers that normally run in `Normal` or `Off` can still force a durable boundary on a specific operation.
+
 ## Reliability stack
 
 - WAL record checksums and replay safety,
@@ -56,6 +64,7 @@ Reliability behavior is validated with crash matrices, failpoint-driven recovery
 - committed transactions remain visible across restart,
 - incomplete/aborted transactions do not leak visibility,
 - repeated recovery runs converge to the same state.
+- durability policy changes trade commit latency against sync strictness, not MVCC visibility rules.
 
 ## Reference files
 

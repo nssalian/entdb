@@ -16,7 +16,7 @@
 
 use crate::catalog::{Catalog, Schema, TableInfo};
 use crate::error::{EntDbError, Result};
-use crate::query::executor::bm25_maintenance;
+use crate::query::executor::{bm25_maintenance, btree_maintenance};
 use crate::query::executor::{encode_mvcc_row, encode_row, Executor, TxExecutionContext};
 use crate::storage::table::Table;
 use crate::storage::tuple::Tuple;
@@ -99,6 +99,7 @@ impl Executor for InsertFromSelectExecutor {
                 crate::query::executor::DecodedRow::Legacy(v) => v,
                 crate::query::executor::DecodedRow::Versioned(v) => v.values,
             };
+            btree_maintenance::on_insert(&self.catalog, &self.table, &inserted_row, tid)?;
             bm25_maintenance::on_insert(&self.catalog, &self.table, &inserted_row, tid)?;
             self.affected_rows = self.affected_rows.saturating_add(1);
         }
