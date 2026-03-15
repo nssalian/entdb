@@ -33,11 +33,12 @@ echo "[3/4] Criterion perf gate"
 "$ROOT_DIR/scripts/criterion_gate.sh"
 
 echo "[4/4] Fuzz smoke"
+export RUSTUP_TOOLCHAIN=nightly
 pushd fuzz >/dev/null
-cargo +nightly fuzz run tuple_roundtrip -- -runs=5000
-cargo +nightly fuzz run wal_decode -- -runs=5000
-cargo +nightly fuzz run polyglot_transpile -- -runs=5000
-cargo +nightly fuzz run query_parse_bind -- -runs=5000
+cargo fuzz run tuple_roundtrip -- -runs=5000
+cargo fuzz run wal_decode -- -runs=5000
+cargo fuzz run polyglot_transpile -- -runs=5000
+cargo fuzz run query_parse_bind -- -runs=5000
 popd >/dev/null
 
 echo "Release readiness gate passed."
