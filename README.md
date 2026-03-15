@@ -115,7 +115,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-entdb = "0.1.0"
+entdb = "0.2.0"
 ```
 
 ```rust

@@ -1,6 +1,6 @@
 [package]
 name = "entdb-server"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "PostgreSQL wire-compatible server for EntDB."
 license = "Apache-2.0"
@@ -16,7 +16,7 @@ name = "entdb"
 path = "src/main.rs"
 
 [dependencies]
-entdb = { version = "0.1.0", path = "../entdb" }
+entdb = { version = "0.2.0", path = "../entdb" }
 clap = { version = "4.5", features = ["derive"] }
 pgwire = { version = "0.28", features = ["scram"] }
 tokio = { version = "1", features = ["full"] }
